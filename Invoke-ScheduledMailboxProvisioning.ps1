@@ -105,29 +105,6 @@ function Invoke-WithRetry {
     }
 }
 
-function Get-AllLicensedUsers {
-    param([string]$GraphToken)
-    $users   = [System.Collections.Generic.List[object]]::new()
-    $uri     = "https://graph.microsoft.com/v1.0/users" +
-               "?`$filter=assignedLicenses/`$count ne 0 and userType eq 'Member'" +
-               "&`$count=true" +
-               "&`$select=id,displayName,userPrincipalName" +
-               "&`$top=999"
-    $headers = @{ Authorization = "Bearer $GraphToken"; ConsistencyLevel = "eventual" }
-
-    $page = 0
-    do {
-        $page++
-        Write-Log "Fetching Graph user page $page ($($users.Count) so far)..."
-        $response = Invoke-WithRetry { Invoke-RestMethod -Method GET -Uri $uri -Headers $headers }
-        foreach ($u in $response.value) {
-            if ($u.userPrincipalName) { $users.Add($u) }
-        }
-        $uri = if ($response.PSObject.Properties['@odata.nextLink']) { $response.'@odata.nextLink' } else { $null }
-    } while ($uri)
-
-    return @($users)
-}
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -158,37 +135,94 @@ try {
     if (-not $SkipAutoExpand)      { Write-Log "Action: Enable auto-expanding archive" }
     if (-not $SkipRetentionPolicy) { Write-Log "Action: Assign retention policy '$retentionPolicyName'" }
 
-    # Acquire tokens via Managed Identity IMDS
-    Write-Log "Acquiring Graph token (User.Read.All) via Managed Identity..."
-    $graphToken = Get-ManagedIdentityToken -Resource "https://graph.microsoft.com/"
-    Write-Log "Graph token acquired." "SUCCESS"
-
+    # Acquire EXO admin token via Managed Identity IMDS (Graph no longer needed)
     Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..."
     $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
     $tokenAcquiredAt = Get-Date
     Write-Log "EXO admin token acquired." "SUCCESS"
 
-    # Enumerate licensed mailbox users
-    Write-Log "Enumerating licensed user mailboxes via Microsoft Graph..."
-    $users = Get-AllLicensedUsers -GraphToken $graphToken
-    Write-Log "Found $($users.Count) licensed user(s)." "SUCCESS"
+    # Fetch current mailbox state via EXO Admin REST (replaces Graph enumeration)
+    # Gets ArchiveStatus, AutoExpandingArchiveEnabled, RetentionPolicy in the same bulk call —
+    # used for both pre-flight filtering and skipping no-op API calls per mailbox.
+    Write-Log "Fetching current mailbox state from EXO Admin REST API..."
+    $allMailboxes = [System.Collections.Generic.List[object]]::new()
+    $uri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox" +
+           "?`$filter=RecipientTypeDetails eq 'UserMailbox'" +
+           "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName,ArchiveStatus,AutoExpandingArchiveEnabled,RetentionPolicy" +
+           "&`$top=1000"
+    do {
+        $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $exoToken" } -Method GET }
+        foreach ($m in $resp.value) { if ($m.UserPrincipalName) { $allMailboxes.Add($m) } }
+        $uri = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
+    } while ($uri)
+    Write-Log "Found $($allMailboxes.Count) user mailbox(es)." "SUCCESS"
 
-    # Process each mailbox
-    $results   = [System.Collections.Generic.List[object]]::new()
-    $total     = $users.Count
-    $idx       = 0
+    # Pre-flight filter: skip mailboxes that already have every required setting
+    $users = @($allMailboxes | Where-Object {
+        $m = $_
+        (-not $SkipArchive         -and $m.ArchiveStatus -ne 'Active') -or
+        (-not $SkipAutoExpand      -and -not [bool]$m.AutoExpandingArchiveEnabled) -or
+        (-not $SkipRetentionPolicy -and $m.RetentionPolicy -ne $retentionPolicyName)
+    })
+    Write-Log "Pre-flight filter: $($users.Count) of $($allMailboxes.Count) mailbox(es) need action." "SUCCESS"
 
-    foreach ($user in $users) {
-        $idx++
-        $upn = $user.userPrincipalName
-        Write-Log "[$idx/$total] Processing $upn..."
+    # Process mailboxes in parallel (ThrottleLimit=8)
+    # At 15K mailboxes, worst-case ~19 min — well within the 60-min token lifetime,
+    # so no token refresh is needed inside the parallel block.
+    Write-Log "Processing $($users.Count) mailbox(es) in parallel (ThrottleLimit=8)..."
+    $total = $users.Count
 
-        # Refresh tokens every ~40 min (access tokens expire after ~60 min)
-        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
-            Write-Log "Refreshing access tokens at mailbox $idx..."
-            $graphToken      = Get-ManagedIdentityToken -Resource "https://graph.microsoft.com/"
-            $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
-            $tokenAcquiredAt = Get-Date
+    $p_token           = $exoToken
+    $p_tenantId        = $tenantId
+    $p_retentionPolicy = $retentionPolicyName
+    $p_skipArchive     = [bool]$SkipArchive
+    $p_skipAutoExpand  = [bool]$SkipAutoExpand
+    $p_skipRetention   = [bool]$SkipRetentionPolicy
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $users | ForEach-Object -Parallel {
+        $user  = $_
+        $upn   = $user.UserPrincipalName
+        $token = $using:p_token
+        $tid   = $using:p_tenantId
+        $retPol        = $using:p_retentionPolicy
+        $skipArchive   = $using:p_skipArchive
+        $skipAutoExpand = $using:p_skipAutoExpand
+        $skipRetention = $using:p_skipRetention
+
+        # Self-contained HTTP helper — no dependency on outer-scope functions.
+        # Creates a fresh HttpClient per call (thread-safe); handles EXO no-op responses.
+        function Invoke-EXORequest {
+            param([string]$Method, [string]$Uri, [string]$Token, [string]$Body = $null)
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                $handler = [System.Net.Http.HttpClientHandler]::new()
+                $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::None
+                $client  = [System.Net.Http.HttpClient]::new($handler)
+                try {
+                    $client.DefaultRequestHeaders.Add("Authorization", "Bearer $Token")
+                    $client.DefaultRequestHeaders.Add("Accept", "application/json")
+                    $req = [System.Net.Http.HttpRequestMessage]::new(
+                        [System.Net.Http.HttpMethod]::new($Method), $Uri)
+                    if ($Body) {
+                        $req.Content = [System.Net.Http.StringContent]::new(
+                            $Body, [System.Text.Encoding]::UTF8, "application/json")
+                    }
+                    $resp = $client.SendAsync($req).Result
+                    $text = $resp.Content.ReadAsStringAsync().Result
+                    if (-not $resp.IsSuccessStatusCode) {
+                        if ($text -match 'already has an archive')                     { return $text }
+                        if ($text -match 'Readonly field AutoExpandingArchiveEnabled') { return $text }
+                        throw "HTTP $([int]$resp.StatusCode): $text"
+                    }
+                    return $text
+                } catch {
+                    if ($attempt -ge 3 -or $_.Exception.Message -notmatch '429|throttl') { throw }
+                    Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+                } finally {
+                    $client.Dispose()
+                    $handler.Dispose()
+                }
+            }
         }
 
         $encodedUPN       = [Uri]::EscapeDataString($upn)
@@ -197,63 +231,63 @@ try {
         $retentionResult  = "N/A"
 
         # 1 ── Enable Archive ──────────────────────────────────────────────────
-        if (-not $SkipArchive) {
-            try {
-                $uri  = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$encodedUPN')/Exchange.UpdateMailboxArchive"
-                $resp = Invoke-WithRetry { Invoke-HttpRequest -Method POST -Uri $uri -Token $exoToken -Body '{"archive":true}' }
-                $archiveResult = if ($resp -match 'already has an archive') {
-                    "Already enabled (no-op)"
-                } else {
-                    Write-Log "$upn`: archive enabled." "SUCCESS"
-                    "Enabled"
+        if (-not $skipArchive) {
+            if ($user.ArchiveStatus -eq 'Active') {
+                $archiveResult = "Already enabled (no-op)"
+            } else {
+                try {
+                    $uri  = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')/Exchange.UpdateMailboxArchive"
+                    $resp = Invoke-EXORequest -Method POST -Uri $uri -Token $token -Body '{"archive":true}'
+                    $archiveResult = if ($resp -match 'already has an archive') { "Already enabled (no-op)" } else { "Enabled" }
+                } catch {
+                    $archiveResult = "Error: $($_.Exception.Message)"
+                    Write-Host "[ERROR] Failed to enable archive for $upn`: $_"
                 }
-            } catch {
-                $archiveResult = "Error: $($_.Exception.Message)"
-                Write-Log "Failed to enable archive for $upn`: $_" "ERROR"
             }
         }
 
         # 2 ── Auto-Expanding Archive ──────────────────────────────────────────
-        if (-not $SkipAutoExpand) {
-            try {
-                $uri    = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$encodedUPN')"
-                $result = Invoke-WithRetry { Invoke-HttpRequest -Method PATCH -Uri $uri -Token $exoToken -Body '{"AutoExpandingArchiveEnabled":true}' }
-                $autoExpandResult = if ($result -match 'Readonly field AutoExpandingArchiveEnabled') {
-                    "Already enabled (no-op)"
-                } else {
-                    Write-Log "$upn`: auto-expanding archive enabled." "SUCCESS"
-                    "Enabled"
+        if (-not $skipAutoExpand) {
+            if ([bool]$user.AutoExpandingArchiveEnabled) {
+                $autoExpandResult = "Already enabled (no-op)"
+            } else {
+                try {
+                    $uri    = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')"
+                    $result = Invoke-EXORequest -Method PATCH -Uri $uri -Token $token -Body '{"AutoExpandingArchiveEnabled":true}'
+                    $autoExpandResult = if ($result -match 'Readonly field AutoExpandingArchiveEnabled') { "Already enabled (no-op)" } else { "Enabled" }
+                } catch {
+                    $autoExpandResult = "Error: $($_.Exception.Message)"
+                    Write-Host "[ERROR] Failed to set auto-expand for $upn`: $_"
                 }
-            } catch {
-                $autoExpandResult = "Error: $($_.Exception.Message)"
-                Write-Log "Failed to set auto-expand for $upn`: $_" "ERROR"
             }
         }
 
         # 3 ── Retention Policy ────────────────────────────────────────────────
-        if (-not $SkipRetentionPolicy) {
-            try {
-                $uri           = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$encodedUPN')"
-                $retentionJson = "{`"RetentionPolicy`":`"$retentionPolicyName`"}"
-                Invoke-WithRetry { Invoke-HttpRequest -Method PATCH -Uri $uri -Token $exoToken -Body $retentionJson | Out-Null }
-                $retentionResult = "Set: '$retentionPolicyName'"
-                Write-Log "$upn`: retention policy set." "SUCCESS"
-            } catch {
-                $retentionResult = "Error: $($_.Exception.Message)"
-                Write-Log "Failed to set retention policy for $upn`: $_" "ERROR"
+        if (-not $skipRetention) {
+            if ($user.RetentionPolicy -eq $retPol) {
+                $retentionResult = "Already set: '$retPol'"
+            } else {
+                try {
+                    $uri = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')"
+                    Invoke-EXORequest -Method PATCH -Uri $uri -Token $token -Body "{`"RetentionPolicy`":`"$retPol`"}" | Out-Null
+                    $retentionResult = "Set: '$retPol'"
+                } catch {
+                    $retentionResult = "Error: $($_.Exception.Message)"
+                    Write-Host "[ERROR] Failed to set retention policy for $upn`: $_"
+                }
             }
         }
 
-        $results.Add([PSCustomObject]@{
-            EOID             = $user.id
-            DisplayName      = $user.displayName
+        [PSCustomObject]@{
+            EOID             = $user.ExternalDirectoryObjectId
+            DisplayName      = $user.DisplayName
             UPN              = $upn
             ArchiveResult    = $archiveResult
             AutoExpandResult = $autoExpandResult
             RetentionResult  = $retentionResult
             Timestamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        })
-    }
+        }
+    } -ThrottleLimit 8 | ForEach-Object { $results.Add($_) }
 
     # ── Summary ───────────────────────────────────────────────────────────────
     $applied = @($results | Where-Object {

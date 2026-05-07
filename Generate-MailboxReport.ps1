@@ -131,8 +131,9 @@ try {
     Write-Log "Graph token acquired." "SUCCESS"
 
     Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..."
-    $exoToken   = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
-    $exoHeaders = @{ Authorization = "Bearer $exoToken" }
+    $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+    $exoHeaders      = @{ Authorization = "Bearer $exoToken" }
+    $tokenAcquiredAt = Get-Date
     Write-Log "EXO admin token acquired." "SUCCESS"
 
     # ── Phase 1: EXO metadata via Admin REST API ───────────────────────────────
@@ -294,19 +295,55 @@ try {
         }
     }
 
-    # ── Phase 5: Archive stats for report-matched mailboxes ───────────────────
+    # ── Phase 5: Archive stats for report-matched mailboxes (parallel) ────────
     $archiveRows = @($results | Where-Object { $_.ArchiveEnabled -eq $true -and $null -eq $_.ArchiveUsedMB })
     if ($archiveRows.Count -gt 0) {
-        Write-Log "Fetching archive stats for $($archiveRows.Count) mailbox(es) with active archives..."
-        foreach ($row in $archiveRows) {
-            try {
-                $archStats        = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($row.EOID)')/ArchiveMailboxStatistics" -Headers $exoHeaders -Method GET }
-                $row.ArchiveUsedMB = ConvertTo-MB $archStats.TotalItemSize
-                $row.ArchiveUsedGB = [math]::Round($row.ArchiveUsedMB / 1024, 3)
-            } catch {
-                $row.ArchiveUsedMB = -1
-                $row.ArchiveUsedGB = -1
+        Write-Log "Fetching archive stats for $($archiveRows.Count) mailbox(es) with active archives (parallel, ThrottleLimit=8)..."
+
+        # Refresh EXO token if it has been running long (Phase 1-4 can take time at scale)
+        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
+            Write-Log "Refreshing EXO token before archive stats collection..."
+            $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+        }
+
+        $p_token    = $exoToken
+        $p_tenantId = $tenantId
+
+        # Parallel fetch — ForEach-Object -Parallel returns new objects; mutating $_ inside
+        # the block does not propagate back. Collect (EOID, stats) then join in parent scope.
+        $archiveStatsList = $archiveRows | ForEach-Object -Parallel {
+            $eoid  = $_.EOID
+            $token = $using:p_token
+            $tid   = $using:p_tenantId
+
+            $usedMB = -1; $usedGB = -1
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                    $resp = Invoke-RestMethod `
+                        -Uri     "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$eoid')/ArchiveMailboxStatistics" `
+                        -Headers @{ Authorization = "Bearer $token" } `
+                        -Method  GET
+                    $s = $resp.TotalItemSize
+                    $usedMB = if     ($null -eq $s)                                            { 0 }
+                              elseif ($s -is [long] -or $s -is [int] -or $s -is [double])     { [math]::Round([double]$s / 1MB, 2) }
+                              elseif ($s.ToString() -match '\(([0-9,]+) bytes\)')              { [math]::Round([long]($Matches[1] -replace ',', '') / 1MB, 2) }
+                              else   { $p = 0L; if ([long]::TryParse($s.ToString(), [ref]$p)) { [math]::Round($p / 1MB, 2) } else { 0 } }
+                    $usedGB = [math]::Round($usedMB / 1024, 3)
+                    break
+                } catch {
+                    if ($attempt -ge 3 -or $_.Exception.Message -notmatch '429|throttl') { break }
+                    Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+                }
             }
+            [PSCustomObject]@{ EOID = $eoid; ArchiveUsedMB = $usedMB; ArchiveUsedGB = $usedGB }
+        } -ThrottleLimit 8
+
+        # Join stats back to $results by EOID (parent-scope object refs are still valid here)
+        $archiveLookup = @{}
+        foreach ($s in $archiveStatsList) { if ($s) { $archiveLookup[$s.EOID] = $s } }
+        foreach ($row in $archiveRows) {
+            $s = $archiveLookup[$row.EOID]
+            if ($s) { $row.ArchiveUsedMB = $s.ArchiveUsedMB; $row.ArchiveUsedGB = $s.ArchiveUsedGB }
         }
     }
 
