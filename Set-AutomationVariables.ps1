@@ -37,6 +37,15 @@ $retentionPolicy    = "Two Year Retention"                    # exact name of th
 # Report recipients — JSON array; edit here or use the update snippet at the bottom
 $reportRecipients   = '["admin@MngEnvMCAP545510.onmicrosoft.com"]'
 
+# Litigation Hold duration — integer days (e.g. 2555 = 7 years, 1825 = 5 years) or "Unlimited".
+# Leave empty to default to Unlimited; the variable will not be written if blank.
+$litigationHoldDuration = "2555"
+
+# Mailbox creation date filter — ISO 8601 date (e.g. "2025-01-01").
+# Only mailboxes created on or after this date will be provisioned.
+# Leave empty to process all mailboxes; the variable will not be written if blank.
+$provisioningCreatedAfter = "2026-03-17"
+
 # ==============================================================================
 # SECTION 3 — Confirm context before writing
 # ==============================================================================
@@ -75,6 +84,8 @@ $provVars = [ordered]@{
     StorageAccountName   = $storageAcctName   # provisioning runbook uploads its log CSV to the same container
     StorageContainer     = $storageContainer
 }
+if ($litigationHoldDuration)    { $provVars['LitigationHoldDuration']   = $litigationHoldDuration }
+if ($provisioningCreatedAfter) { $provVars['ProvisioningCreatedAfter'] = $provisioningCreatedAfter }
 
 function Set-OrNewAutomationVariable {
     param(
@@ -89,12 +100,26 @@ function Set-OrNewAutomationVariable {
         -Name                  $Name `
         -ErrorAction           SilentlyContinue
     if ($existing) {
-        Set-AzAutomationVariable `
-            -ResourceGroupName     $ResourceGroupName `
-            -AutomationAccountName $AutomationAccountName `
-            -Name                  $Name `
-            -Value                 $Value `
-            -Encrypted             $false
+        if ($existing.Encrypted) {
+            # Azure won't let you change encryption in-place — remove and recreate
+            Remove-AzAutomationVariable `
+                -ResourceGroupName     $ResourceGroupName `
+                -AutomationAccountName $AutomationAccountName `
+                -Name                  $Name
+            New-AzAutomationVariable `
+                -ResourceGroupName     $ResourceGroupName `
+                -AutomationAccountName $AutomationAccountName `
+                -Name                  $Name `
+                -Value                 $Value `
+                -Encrypted             $false
+        } else {
+            Set-AzAutomationVariable `
+                -ResourceGroupName     $ResourceGroupName `
+                -AutomationAccountName $AutomationAccountName `
+                -Name                  $Name `
+                -Value                 $Value `
+                -Encrypted             $false
+        }
     } else {
         New-AzAutomationVariable `
             -ResourceGroupName     $ResourceGroupName `
@@ -157,4 +182,33 @@ Set-AzAutomationVariable `
     -Name                  "ReportRecipients" `
     -Encrypted             $false `
     -Value                 '["it-team@contoso.com","manager@contoso.com","ciso@contoso.com"]'
+#>
+
+# ==============================================================================
+# SNIPPET — Set or update LitigationHoldDuration later (run independently)
+# ==============================================================================
+<#
+Set-AzAutomationVariable `
+    -ResourceGroupName     $rg `
+    -AutomationAccountName $provAccountName `
+    -Name                  "LitigationHoldDuration" `
+    -Encrypted             $false `
+    -Value                 "2555"   # days — or "Unlimited"
+#>
+
+# ==============================================================================
+# SNIPPET — Set ProvisioningCreatedAfter to process only mailboxes created on or
+#           after a given date (ISO 8601, e.g. "2025-01-01"). Remove the variable
+#           entirely to revert to processing all mailboxes.
+# ==============================================================================
+<#
+Set-AzAutomationVariable `
+    -ResourceGroupName     $rg `
+    -AutomationAccountName $provAccountName `
+    -Name                  "ProvisioningCreatedAfter" `
+    -Encrypted             $false `
+    -Value                 "2025-01-01"
+
+# To remove the filter and process all mailboxes again:
+# Remove-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $provAccountName -Name "ProvisioningCreatedAfter"
 #>

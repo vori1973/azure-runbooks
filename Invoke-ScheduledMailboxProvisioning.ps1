@@ -15,15 +15,23 @@
     via cross-account Start-AzAutomationRunbook.
 
     Automation Variables required (in aa-exo-provisioning):
-      TenantId             — Azure AD directory ID
-      Organization         — .onmicrosoft.com domain
-      SenderEmail          — FROM address for notification email
-      RecipientEmail       — TO address for provisioning completion notification
-      RetentionPolicyName  — exact EXO retention policy name
-      ReportingAccountRG   — resource group of the reporting Automation Account
-      ReportingAccountName — name of the reporting Automation Account
-      StorageAccountName   — blob storage account name
-      StorageContainer     — blob container name
+      TenantId                  — Azure AD directory ID
+      Organization              — .onmicrosoft.com domain
+      SenderEmail               — FROM address for notification email
+      RecipientEmail            — TO address for provisioning completion notification
+      RetentionPolicyName       — exact EXO retention policy name
+      ReportingAccountRG        — resource group of the reporting Automation Account
+      ReportingAccountName      — name of the reporting Automation Account
+      StorageAccountName        — blob storage account name
+      StorageContainer          — blob container name
+      LitigationHoldDuration    — (optional) hold duration in days (e.g. 2555) or "Unlimited".
+                                   If the variable does not exist, duration defaults to Unlimited.
+      ProvisioningCreatedAfter  — (optional) ISO 8601 date string (e.g. "2025-01-01").
+                                   When set, only mailboxes created on or after this date are
+                                   processed. Filtered client-side after fetch (EXO Admin REST
+                                   exposes WhenMailboxCreated as Edm.String so OData datetime
+                                   operators are not supported). If absent, all mailboxes are
+                                   processed.
 
 .PARAMETER SkipArchive
     Skip enabling archive mailboxes.
@@ -33,12 +41,16 @@
 
 .PARAMETER SkipRetentionPolicy
     Skip assigning the retention policy.
+
+.PARAMETER SkipLitigationHold
+    Skip enabling Litigation Hold.
 #>
 
 param(
     [switch]$SkipArchive,
     [switch]$SkipAutoExpand,
     [switch]$SkipRetentionPolicy,
+    [switch]$SkipLitigationHold,
     [bool]$SendAsAttachment = $false
 )
 
@@ -55,7 +67,7 @@ function Write-Log {
 
 function Get-ManagedIdentityToken {
     param([string]$Resource)
-    (Get-AzAccessToken -ResourceUrl $Resource).Token
+    (Get-AzAccessToken -ResourceUrl $Resource -AsSecureString).Token | ConvertFrom-SecureString -AsPlainText
 }
 
 function Invoke-HttpRequest {
@@ -111,8 +123,8 @@ function Invoke-WithRetry {
 try {
     Write-Log "=== Invoke-ScheduledMailboxProvisioning Started ==="
 
-    if ($SkipArchive -and $SkipAutoExpand -and $SkipRetentionPolicy) {
-        throw "All three actions are skipped. Remove at least one -Skip* switch."
+    if ($SkipArchive -and $SkipAutoExpand -and $SkipRetentionPolicy -and $SkipLitigationHold) {
+        throw "All actions are skipped. Remove at least one -Skip* switch."
     }
 
     # Authenticate Az cmdlets using the System-Assigned Managed Identity
@@ -129,11 +141,31 @@ try {
     $storageAcctName     = Get-AutomationVariable -Name "StorageAccountName"
     $storageContainer    = Get-AutomationVariable -Name "StorageContainer"
 
+    # Read optional LitigationHoldDuration variable (missing variable = Unlimited)
+    $litigationHoldDuration = $null
+    try   { $litigationHoldDuration = Get-AutomationVariable -Name "LitigationHoldDuration" }
+    catch { Write-Log "LitigationHoldDuration variable not found — defaulting to Unlimited." }
+
+    # Read optional ProvisioningCreatedAfter variable (missing = process all mailboxes)
+    $createdAfter = $null
+    try {
+        $val = Get-AutomationVariable -Name "ProvisioningCreatedAfter"
+        if ($val) {
+            $createdAfter = [datetime]::Parse($val, [System.Globalization.CultureInfo]::InvariantCulture,
+                                              [System.Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+        }
+    } catch { Write-Log "ProvisioningCreatedAfter variable not found — processing all mailboxes." }
+
     Write-Log "Organization : $organization"
     Write-Log "Retention    : $retentionPolicyName"
+    if ($createdAfter) { Write-Log "Date filter  : mailboxes created on or after $($createdAfter.ToString('yyyy-MM-dd')) UTC" }
     if (-not $SkipArchive)         { Write-Log "Action: Enable archive mailbox" }
     if (-not $SkipAutoExpand)      { Write-Log "Action: Enable auto-expanding archive" }
     if (-not $SkipRetentionPolicy) { Write-Log "Action: Assign retention policy '$retentionPolicyName'" }
+    if (-not $SkipLitigationHold) {
+        $durationLabel = if ($litigationHoldDuration) { $litigationHoldDuration } else { "Unlimited" }
+        Write-Log "Action: Enable Litigation Hold (duration: $durationLabel)"
+    }
 
     # Acquire EXO admin token via Managed Identity IMDS (Graph no longer needed)
     Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..."
@@ -144,25 +176,37 @@ try {
     # Fetch current mailbox state via EXO Admin REST (replaces Graph enumeration)
     # Gets ArchiveStatus, AutoExpandingArchiveEnabled, RetentionPolicy in the same bulk call —
     # used for both pre-flight filtering and skipping no-op API calls per mailbox.
-    Write-Log "Fetching current mailbox state from EXO Admin REST API..."
+    # WhenMailboxCreated is Edm.String in the EXO Admin REST schema — OData datetime
+    # comparison operators are unsupported on it, so date filtering is done client-side below.
+    Write-Log "Fetching all user mailboxes from EXO Admin REST API..."
     $allMailboxes = [System.Collections.Generic.List[object]]::new()
     $uri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox" +
            "?`$filter=RecipientTypeDetails eq 'UserMailbox'" +
-           "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName,ArchiveStatus,AutoExpandingArchiveEnabled,RetentionPolicy" +
+           "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName,ArchiveStatus,AutoExpandingArchiveEnabled,RetentionPolicy,LitigationHoldEnabled,WhenMailboxCreated" +
            "&`$top=1000"
     do {
         $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $exoToken" } -Method GET }
         foreach ($m in $resp.value) { if ($m.UserPrincipalName) { $allMailboxes.Add($m) } }
         $uri = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
     } while ($uri)
-    Write-Log "Found $($allMailboxes.Count) user mailbox(es)." "SUCCESS"
+    Write-Log "API returned $($allMailboxes.Count) user mailbox(es)." "SUCCESS"
+
+    # Client-side safety net: re-apply the date filter in case the server ignored it
+    if ($createdAfter) {
+        $beforeCount  = $allMailboxes.Count
+        $allMailboxes = [System.Collections.Generic.List[object]]($allMailboxes | Where-Object {
+            $_.WhenMailboxCreated -and [datetime]$_.WhenMailboxCreated -ge $createdAfter
+        })
+        Write-Log "Date filter (client-side): $($allMailboxes.Count) of $beforeCount mailbox(es) match." "SUCCESS"
+    }
 
     # Pre-flight filter: skip mailboxes that already have every required setting
     $users = @($allMailboxes | Where-Object {
         $m = $_
         (-not $SkipArchive         -and $m.ArchiveStatus -ne 'Active') -or
         (-not $SkipAutoExpand      -and -not [bool]$m.AutoExpandingArchiveEnabled) -or
-        (-not $SkipRetentionPolicy -and $m.RetentionPolicy -ne $retentionPolicyName)
+        (-not $SkipRetentionPolicy -and $m.RetentionPolicy -ne $retentionPolicyName) -or
+        (-not $SkipLitigationHold  -and -not [bool]$m.LitigationHoldEnabled)
     })
     Write-Log "Pre-flight filter: $($users.Count) of $($allMailboxes.Count) mailbox(es) need action." "SUCCESS"
 
@@ -178,6 +222,8 @@ try {
     $p_skipArchive     = [bool]$SkipArchive
     $p_skipAutoExpand  = [bool]$SkipAutoExpand
     $p_skipRetention   = [bool]$SkipRetentionPolicy
+    $p_skipLitHold     = [bool]$SkipLitigationHold
+    $p_litHoldDuration = $litigationHoldDuration
 
     $results = [System.Collections.Generic.List[object]]::new()
     $users | ForEach-Object -Parallel {
@@ -185,10 +231,12 @@ try {
         $upn   = $user.UserPrincipalName
         $token = $using:p_token
         $tid   = $using:p_tenantId
-        $retPol        = $using:p_retentionPolicy
-        $skipArchive   = $using:p_skipArchive
-        $skipAutoExpand = $using:p_skipAutoExpand
-        $skipRetention = $using:p_skipRetention
+        $retPol          = $using:p_retentionPolicy
+        $skipArchive     = $using:p_skipArchive
+        $skipAutoExpand  = $using:p_skipAutoExpand
+        $skipRetention   = $using:p_skipRetention
+        $skipLitHold     = $using:p_skipLitHold
+        $litHoldDuration = $using:p_litHoldDuration
 
         # Self-contained HTTP helper — no dependency on outer-scope functions.
         # Creates a fresh HttpClient per call (thread-safe); handles EXO no-op responses.
@@ -229,6 +277,7 @@ try {
         $archiveResult    = "N/A"
         $autoExpandResult = "N/A"
         $retentionResult  = "N/A"
+        $litigationResult = "N/A"
 
         # 1 ── Enable Archive ──────────────────────────────────────────────────
         if (-not $skipArchive) {
@@ -278,28 +327,55 @@ try {
             }
         }
 
+        # 4 ── Litigation Hold ─────────────────────────────────────────────────
+        if (-not $skipLitHold) {
+            if ([bool]$user.LitigationHoldEnabled) {
+                $litigationResult = "Already enabled (no-op)"
+            } else {
+                try {
+                    $bodyObj = [ordered]@{ LitigationHoldEnabled = $true }
+                    if ($litHoldDuration) { $bodyObj['LitigationHoldDuration'] = $litHoldDuration }
+                    $bodyJson = $bodyObj | ConvertTo-Json -Compress
+                    $uri = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')"
+                    Invoke-EXORequest -Method PATCH -Uri $uri -Token $token -Body $bodyJson | Out-Null
+                    $holdSuffix   = if ($litHoldDuration) { " (duration: $litHoldDuration)" } else { "" }
+                    $litigationResult = "Enabled$holdSuffix"
+                } catch {
+                    $litigationResult = "Error: $($_.Exception.Message)"
+                    Write-Host "[ERROR] Failed to enable Litigation Hold for $upn`: $_"
+                }
+            }
+        }
+
         [PSCustomObject]@{
-            EOID             = $user.ExternalDirectoryObjectId
-            DisplayName      = $user.DisplayName
-            UPN              = $upn
-            ArchiveResult    = $archiveResult
-            AutoExpandResult = $autoExpandResult
-            RetentionResult  = $retentionResult
-            Timestamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            EOID                 = $user.ExternalDirectoryObjectId
+            DisplayName          = $user.DisplayName
+            UPN                  = $upn
+            ArchiveResult        = $archiveResult
+            AutoExpandResult     = $autoExpandResult
+            RetentionResult      = $retentionResult
+            LitigationHoldResult = $litigationResult
+            Timestamp            = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         }
     } -ThrottleLimit 8 | ForEach-Object { $results.Add($_) }
 
     # ── Summary ───────────────────────────────────────────────────────────────
     $applied = @($results | Where-Object {
-        $_.ArchiveResult    -match '^Enabled' -or
-        $_.AutoExpandResult -match '^Enabled' -or
-        $_.RetentionResult  -match '^Set'
+        $_.ArchiveResult        -match '^Enabled' -or
+        $_.AutoExpandResult     -match '^Enabled' -or
+        $_.RetentionResult      -match '^Set' -or
+        $_.LitigationHoldResult -match '^Enabled'
     }).Count
-    $noops  = @($results | Where-Object { $_.ArchiveResult -match '^Already' }).Count
+    $noops  = @($results | Where-Object {
+        $_.ArchiveResult        -match '^Already' -or
+        $_.AutoExpandResult     -match '^Already' -or
+        $_.LitigationHoldResult -match '^Already'
+    }).Count
     $errors = @($results | Where-Object {
-        $_.ArchiveResult    -match '^Error' -or
-        $_.AutoExpandResult -match '^Error' -or
-        $_.RetentionResult  -match '^Error'
+        $_.ArchiveResult        -match '^Error' -or
+        $_.AutoExpandResult     -match '^Error' -or
+        $_.RetentionResult      -match '^Error' -or
+        $_.LitigationHoldResult -match '^Error'
     }).Count
 
     Write-Log "Total: $total  |  Applied: $applied  |  No-op: $noops  |  Errors: $errors"

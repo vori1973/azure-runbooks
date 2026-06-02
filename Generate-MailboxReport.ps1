@@ -53,7 +53,7 @@ function Write-Log {
 
 function Get-ManagedIdentityToken {
     param([string]$Resource)
-    (Get-AzAccessToken -ResourceUrl $Resource).Token
+    (Get-AzAccessToken -ResourceUrl $Resource -AsSecureString).Token | ConvertFrom-SecureString -AsPlainText
 }
 
 function ConvertTo-MB {
@@ -143,7 +143,7 @@ try {
            "?`$filter=RecipientTypeDetails eq 'UserMailbox'" +
            "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName," +
            "ProhibitSendQuota,ArchiveStatus,ArchiveQuota,AutoExpandingArchiveEnabled," +
-           "RetentionPolicy,RetentionHoldEnabled" +
+           "RetentionPolicy,RetentionHoldEnabled,LitigationHoldEnabled,LitigationHoldDuration" +
            "&`$top=1000"
     do {
         $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers $exoHeaders -Method GET }
@@ -165,6 +165,11 @@ try {
             AutoExpandingArchiveEnabled = if ($_.PSObject.Properties['AutoExpandingArchiveEnabled']) { [bool]$_.AutoExpandingArchiveEnabled } else { $false }
             RetentionPolicy             = if ($_.PSObject.Properties['RetentionPolicy']) { $_.RetentionPolicy } else { $null }
             RetentionHoldEnabled        = if ($_.PSObject.Properties['RetentionHoldEnabled']) { [bool]$_.RetentionHoldEnabled } else { $false }
+            LitigationHoldEnabled       = if ($_.PSObject.Properties['LitigationHoldEnabled']) { [bool]$_.LitigationHoldEnabled } else { $false }
+            LitigationHoldDuration      = if ($_.PSObject.Properties['LitigationHoldDuration'] -and $_.LitigationHoldDuration) {
+                                              $raw = $_.LitigationHoldDuration.ToString()
+                                              if ($raw -match '^(\d+)\.') { [int]$Matches[1] } else { $raw }
+                                          } else { $null }
         }
     })
 
@@ -231,6 +236,8 @@ try {
                 ArchiveQuotaGB              = if ($mbx.ArchiveQuotaMBComputed -gt 0) { [math]::Round($mbx.ArchiveQuotaMBComputed / 1024, 3) } else { 0 }
                 RetentionPolicy             = $mbx.RetentionPolicy
                 RetentionHoldEnabled        = $mbx.RetentionHoldEnabled
+                LitigationHoldEnabled       = $mbx.LitigationHoldEnabled
+                LitigationHoldDuration      = $mbx.LitigationHoldDuration
                 Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
                 Timestamp                   = $ts
             })
@@ -279,6 +286,8 @@ try {
                     ArchiveQuotaGB              = if ($mbx.ArchiveQuotaMBComputed -gt 0) { [math]::Round($mbx.ArchiveQuotaMBComputed / 1024, 3) } else { 0 }
                     RetentionPolicy             = $mbx.RetentionPolicy
                     RetentionHoldEnabled        = $mbx.RetentionHoldEnabled
+                    LitigationHoldEnabled       = $mbx.LitigationHoldEnabled
+                    LitigationHoldDuration      = $mbx.LitigationHoldDuration
                     Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
                     Timestamp                   = $ts
                 })
@@ -289,7 +298,9 @@ try {
                     ItemCount = $null; DeletedItemCount = $null; DeletedItemSizeMB = $null; LastActivityDate = $null
                     ArchiveStatus = $mbx.ArchiveStatus; ArchiveEnabled = $false; AutoExpandingArchiveEnabled = $false
                     ArchiveUsedMB = $null; ArchiveUsedGB = $null; ArchiveQuotaMB = 0; ArchiveQuotaGB = 0
-                    RetentionPolicy = $null; RetentionHoldEnabled = $false; Status = 'ERROR'; Timestamp = $ts
+                    RetentionPolicy = $null; RetentionHoldEnabled = $false
+                    LitigationHoldEnabled = $false; LitigationHoldDuration = $null
+                    Status = 'ERROR'; Timestamp = $ts
                 })
             }
         }

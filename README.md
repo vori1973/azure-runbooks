@@ -10,7 +10,7 @@ No app registrations, no certificates, no secrets.
 ```
 azure-runbooks/
   Generate-MailboxReport.ps1           — weekly mailbox usage report → Blob Storage + email
-  Invoke-ScheduledMailboxProvisioning.ps1 — daily archive/retention policy enforcement
+  Invoke-ScheduledMailboxProvisioning.ps1 — daily archive, retention policy, and litigation hold enforcement
   Send-ReportNotification.ps1          — shared email notification runbook (called by both above)
   Set-AutomationVariables.ps1          — one-time setup: writes all Automation Variables
   README.md                            — this file
@@ -410,6 +410,7 @@ It is safe to re-run — existing values are overwritten.
 | `ReportingAccountName` | Name of the reporting Automation Account |
 | `StorageAccountName` | Blob Storage account name |
 | `StorageContainer` | Container name (`reports`) |
+| `LitigationHoldDuration` | **(Optional)** Hold duration in days (e.g. `2555` = 7 years) or `Unlimited`. If absent, defaults to Unlimited. |
 
 **aa-exo-reporting**
 
@@ -580,6 +581,7 @@ single sender mailbox — the reporting identity cannot send as any other user i
 | `SkipArchive` | off | Skip enabling archive mailboxes |
 | `SkipAutoExpand` | off | Skip enabling auto-expanding archive |
 | `SkipRetentionPolicy` | off | Skip assigning the retention policy |
+| `SkipLitigationHold` | off | Skip enabling Litigation Hold |
 | `SendAsAttachment` | `$false` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
 
 ### Send-ReportNotification.ps1
