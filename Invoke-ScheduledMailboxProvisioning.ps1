@@ -435,7 +435,7 @@ try {
             BlobName         = $blobName
             RowCount         = $total
             SendAsAttachment = $SendAsAttachment
-        }
+        } | Out-Null
     Write-Log "Send-ReportNotification triggered." "SUCCESS"
 
 } catch {
