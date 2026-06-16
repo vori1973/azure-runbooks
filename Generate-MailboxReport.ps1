@@ -48,7 +48,7 @@ $ErrorActionPreference = "Stop"
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[$ts] [$Level] $Message"
+    Write-Output "[$ts] [$Level] $Message"
 }
 
 function Get-ManagedIdentityToken {
