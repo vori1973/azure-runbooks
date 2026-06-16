@@ -167,6 +167,29 @@ try {
         Write-Log "Action: Enable Litigation Hold (duration: $durationLabel)"
     }
 
+    # ── Pre-flight: validate Blob Storage permissions before the long provisioning loop ──
+    Write-Log "Pre-flight: validating Blob Storage permissions (Storage Blob Data Contributor + Storage Blob Delegator)..."
+    $storageCtx = New-AzStorageContext -StorageAccountName $storageAcctName -UseConnectedAccount
+    $checkBlob  = ".perm-check-$(New-Guid)"
+    $checkFile  = Join-Path $env:TEMP $checkBlob
+    try {
+        [System.IO.File]::WriteAllText($checkFile, "perm-check")
+        Set-AzStorageBlobContent -Container $storageContainer -File $checkFile -Blob $checkBlob -Context $storageCtx -Force | Out-Null
+        New-AzStorageBlobSASToken -Container $storageContainer -Blob $checkBlob -Permission r `
+            -ExpiryTime (Get-Date).AddMinutes(5) -Context $storageCtx -FullUri | Out-Null
+        Remove-AzStorageBlob -Container $storageContainer -Blob $checkBlob -Context $storageCtx -Force -ErrorAction SilentlyContinue
+        Write-Log "Pre-flight passed — Storage Blob Data Contributor (upload) and Storage Blob Delegator (SAS) both confirmed on $storageAcctName/$storageContainer." "SUCCESS"
+    } catch {
+        $permMsg = "Pre-flight check failed — Blob Storage 403. " +
+                   "Grant the provisioning Managed Identity 'Storage Blob Data Contributor' on the container " +
+                   "and 'Storage Blob Delegator' on the storage account. " +
+                   "See README Troubleshooting section. Detail: $_"
+        Write-Log $permMsg "ERROR"
+        throw $permMsg
+    } finally {
+        Remove-Item $checkFile -Force -ErrorAction SilentlyContinue
+    }
+
     # Acquire EXO admin token via Managed Identity IMDS (Graph no longer needed)
     Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..."
     $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
@@ -387,7 +410,6 @@ try {
     Write-Log "CSV written: $logPath ($($results.Count) rows)." "SUCCESS"
 
     Write-Log "Uploading to Blob Storage ($storageAcctName / $storageContainer)..."
-    $storageCtx = New-AzStorageContext -StorageAccountName $storageAcctName -UseConnectedAccount
     Set-AzStorageBlobContent -Container $storageContainer -File $logPath -Blob $blobName -Context $storageCtx -Force | Out-Null
     Write-Log "Blob uploaded: $blobName" "SUCCESS"
 
