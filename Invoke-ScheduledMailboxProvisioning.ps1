@@ -44,6 +44,10 @@
 
 .PARAMETER SkipLitigationHold
     Skip enabling Litigation Hold.
+
+.PARAMETER DebugLogs
+    When $true, emit verbose DEBUG-level lines (token acquisition, action announcements, SAS generation, notification trigger).
+    Default $false — only INFO / WARN / ERROR / SUCCESS lines are written, reducing job output volume.
 #>
 
 param(
@@ -51,7 +55,8 @@ param(
     [switch]$SkipAutoExpand,
     [switch]$SkipRetentionPolicy,
     [switch]$SkipLitigationHold,
-    [bool]$SendAsAttachment = $false
+    [bool]$SendAsAttachment = $false,
+    [bool]$DebugLogs = $false
 )
 
 Set-StrictMode -Version Latest
@@ -61,6 +66,7 @@ $ErrorActionPreference = "Stop"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
+    if ($Level -eq "DEBUG" -and -not $script:DebugLogs) { return }
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Output "[$ts] [$Level] $Message"
 }
@@ -159,12 +165,12 @@ try {
     Write-Log "Organization : $organization"
     Write-Log "Retention    : $retentionPolicyName"
     if ($createdAfter) { Write-Log "Date filter  : mailboxes created on or after $($createdAfter.ToString('yyyy-MM-dd')) UTC" }
-    if (-not $SkipArchive)         { Write-Log "Action: Enable archive mailbox" }
-    if (-not $SkipAutoExpand)      { Write-Log "Action: Enable auto-expanding archive" }
-    if (-not $SkipRetentionPolicy) { Write-Log "Action: Assign retention policy '$retentionPolicyName'" }
+    if (-not $SkipArchive)         { Write-Log "Action: Enable archive mailbox" "DEBUG" }
+    if (-not $SkipAutoExpand)      { Write-Log "Action: Enable auto-expanding archive" "DEBUG" }
+    if (-not $SkipRetentionPolicy) { Write-Log "Action: Assign retention policy '$retentionPolicyName'" "DEBUG" }
     if (-not $SkipLitigationHold) {
         $durationLabel = if ($litigationHoldDuration) { $litigationHoldDuration } else { "Unlimited" }
-        Write-Log "Action: Enable Litigation Hold (duration: $durationLabel)"
+        Write-Log "Action: Enable Litigation Hold (duration: $durationLabel)" "DEBUG"
     }
 
     # ── Pre-flight: validate Blob Storage permissions before the long provisioning loop ──
@@ -178,7 +184,7 @@ try {
         New-AzStorageBlobSASToken -Container $storageContainer -Blob $checkBlob -Permission r `
             -ExpiryTime (Get-Date).AddMinutes(5) -Context $storageCtx -FullUri | Out-Null
         Remove-AzStorageBlob -Container $storageContainer -Blob $checkBlob -Context $storageCtx -Force -ErrorAction SilentlyContinue
-        Write-Log "Pre-flight passed — Storage Blob Data Contributor (upload) and Storage Blob Delegator (SAS) both confirmed on $storageAcctName/$storageContainer." "SUCCESS"
+        Write-Log "Pre-flight passed — Storage Blob Data Contributor (upload) and Storage Blob Delegator (SAS) both confirmed on $storageAcctName/$storageContainer." "DEBUG"
     } catch {
         $permMsg = "Pre-flight check failed — Blob Storage 403. " +
                    "Grant the provisioning Managed Identity 'Storage Blob Data Contributor' on the container " +
@@ -191,10 +197,10 @@ try {
     }
 
     # Acquire EXO admin token via Managed Identity IMDS (Graph no longer needed)
-    Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..."
+    Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..." "DEBUG"
     $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
     $tokenAcquiredAt = Get-Date
-    Write-Log "EXO admin token acquired." "SUCCESS"
+    Write-Log "EXO admin token acquired." "DEBUG"
 
     # Fetch current mailbox state via EXO Admin REST (replaces Graph enumeration)
     # Gets ArchiveStatus, AutoExpandingArchiveEnabled, RetentionPolicy in the same bulk call —
@@ -407,7 +413,7 @@ try {
     $blobName   = "MailboxProvisioning_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     $logPath    = Join-Path $env:TEMP $blobName
     $results | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
-    Write-Log "CSV written: $logPath ($($results.Count) rows)." "SUCCESS"
+    Write-Log "CSV written: $logPath ($($results.Count) rows)." "DEBUG"
 
     Write-Log "Uploading to Blob Storage ($storageAcctName / $storageContainer)..."
     Set-AzStorageBlobContent -Container $storageContainer -File $logPath -Blob $blobName -Context $storageCtx -Force | Out-Null
@@ -421,10 +427,10 @@ try {
         -ExpiryTime (Get-Date).AddHours(24) `
         -Context    $storageCtx `
         -FullUri
-    Write-Log "SAS URL (24h): generated." "SUCCESS"
+    Write-Log "SAS URL (24h): generated." "DEBUG"
 
     # ── Cross-account notification via Send-ReportNotification ────────────────
-    Write-Log "Triggering Send-ReportNotification in $reportingAccount..."
+    Write-Log "Triggering Send-ReportNotification in $reportingAccount..." "DEBUG"
     Start-AzAutomationRunbook `
         -ResourceGroupName     $reportingRG `
         -AutomationAccountName $reportingAccount `
@@ -436,7 +442,7 @@ try {
             RowCount         = $total
             SendAsAttachment = $SendAsAttachment
         } | Out-Null
-    Write-Log "Send-ReportNotification triggered." "SUCCESS"
+    Write-Log "Send-ReportNotification triggered." "DEBUG"
 
 } catch {
     Write-Log "Script failed: $_" "ERROR"
