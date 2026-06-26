@@ -475,9 +475,9 @@ Test in this order:
 2. **`Generate-MailboxReport`** (reporting account) — no parameters required; verify:
    - Status: Completed
    - CSV blob visible in the storage container
-   - `SAS URL (24h): generated.` logged in output (actual URL is not logged — it is a bearer token)
    - `Send-ReportNotification` job appears in the reporting account Jobs list
    - Email received with a working 24-hour download link
+   - To see token acquisition and SAS generation detail, re-run with `-DebugLogs $true`
 
 3. **`Invoke-ScheduledMailboxProvisioning`** (provisioning account) — no parameters required; verify:
    - Status: Completed
@@ -573,6 +573,7 @@ single sender mailbox — the reporting identity cannot send as any other user i
 |---|---|---|
 | `ReportsPeriod` | `D7` | Graph Reports API period: `D7`, `D30`, `D90`, `D180` |
 | `SendAsAttachment` | `$false` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
+| `DebugLogs` | `$false` | When `$true`, emit verbose DEBUG-level lines: token acquisition, storage context init, SAS generation, notification trigger. Leave `$false` in scheduled runs to keep job output lean. Pass `$true` when troubleshooting. |
 
 ### Invoke-ScheduledMailboxProvisioning.ps1
 
@@ -583,6 +584,7 @@ single sender mailbox — the reporting identity cannot send as any other user i
 | `SkipRetentionPolicy` | off | Skip assigning the retention policy |
 | `SkipLitigationHold` | off | Skip enabling Litigation Hold |
 | `SendAsAttachment` | `$false` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
+| `DebugLogs` | `$false` | When `$true`, emit verbose DEBUG-level lines: token acquisition, action announcements, pre-flight result, SAS generation, notification trigger. Leave `$false` in scheduled runs to keep job output lean. Pass `$true` when troubleshooting. |
 
 ### Send-ReportNotification.ps1
 
@@ -676,3 +678,31 @@ New-AzRoleAssignment -ObjectId $miId -RoleDefinitionName "Storage Blob Delegator
 **Why `Generate-MailboxReport` may work while `Invoke-ScheduledMailboxProvisioning` fails:**
 The two runbooks run under different Managed Identities (different Automation Accounts). The
 reporting MI may already have both roles from a prior deployment while the provisioning MI does not.
+
+---
+
+### ArchiveUsedMB / ArchiveUsedGB = -1 in the mailbox report
+
+**Symptom:** Exported CSV contains `-1` in the `ArchiveUsedMB` and `ArchiveUsedGB` columns for
+some or many mailboxes that have `ArchiveEnabled = True`.
+
+**Cause:** The `Exchange.GetMailboxStatistics` bound function call on the archive mailbox GUID returned
+an error. Common reasons:
+
+| Cause | Detail | CSV value |
+|---|---|---|
+| Empty / newly provisioned archive | Archive was recently enabled and has never received mail. The endpoint returns HTTP 404 when no statistics object exists yet. The runbook treats this as `0`. | `0` |
+| Geo / satellite routing | Mailbox is in a satellite geo; the endpoint occasionally returns 503 before routing stabilises | `-1` |
+| Inactive or soft-deleted mailbox | Archive endpoint returns an unexpected error for mailboxes in a pending-delete state | `-1` |
+| Transient API error | Any non-throttle HTTP error (500, 502, etc.) exhausts the 3-attempt retry loop | `-1` |
+
+**Diagnose:** Re-run the report with `-DebugLogs $true`. For each failure the job Output tab will
+show a `[WARN]` line with the EOID and the exact HTTP error, plus a summary line at the end:
+
+```
+[WARN] Archive stats failed for <EOID> (attempt 1/3): HTTP 404: ...
+[WARN] 12 of 340 archive stat fetch(es) failed (ArchiveUsedMB = -1) — see job Output tab for per-mailbox [WARN] lines.
+```
+
+**Fix:** Re-run the report 24–48 hours later. Mailboxes whose archives were recently enabled will
+have finished provisioning by then and will return valid stats.

@@ -32,12 +32,17 @@
 
 .PARAMETER ReportsPeriod
     Graph Reports API period. Default D7. Options: D7, D30, D90, D180.
+
+.PARAMETER DebugLogs
+    When $true, emit verbose DEBUG-level lines (token acquisition, SAS generation, notification trigger).
+    Default $false — only INFO / WARN / ERROR / SUCCESS lines are written, reducing job output volume.
 #>
 
 param(
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$ReportsPeriod = 'D7',
-    [bool]$SendAsAttachment = $false
+    [bool]$SendAsAttachment = $false,
+    [bool]$DebugLogs = $false
 )
 
 Set-StrictMode -Version Latest
@@ -47,6 +52,7 @@ $ErrorActionPreference = "Stop"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
+    if ($Level -eq "DEBUG" -and -not $script:DebugLogs) { return }
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Output "[$ts] [$Level] $Message"
 }
@@ -121,20 +127,20 @@ try {
 
     # Initialise storage context (OAuth — Managed Identity)
     $storageCtx = New-AzStorageContext -StorageAccountName $storageAcctName -UseConnectedAccount
-    Write-Log "Storage context initialised for $storageAcctName."
+    Write-Log "Storage context initialised for $storageAcctName." "DEBUG"
 
     $exportPath = Join-Path $env:TEMP "MailboxOverview_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 
     # Acquire tokens via Managed Identity
-    Write-Log "Acquiring Graph token (Reports.Read.All) via Managed Identity..."
+    Write-Log "Acquiring Graph token (Reports.Read.All) via Managed Identity..." "DEBUG"
     $graphToken = Get-ManagedIdentityToken -Resource "https://graph.microsoft.com/"
-    Write-Log "Graph token acquired." "SUCCESS"
+    Write-Log "Graph token acquired." "DEBUG"
 
-    Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..."
+    Write-Log "Acquiring EXO admin token (Exchange.ManageAsApp) via Managed Identity..." "DEBUG"
     $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
     $exoHeaders      = @{ Authorization = "Bearer $exoToken" }
     $tokenAcquiredAt = Get-Date
-    Write-Log "EXO admin token acquired." "SUCCESS"
+    Write-Log "EXO admin token acquired." "DEBUG"
 
     # ── Phase 1: EXO metadata via Admin REST API ───────────────────────────────
     Write-Log "Retrieving mailbox metadata via EXO Admin REST API..."
@@ -143,7 +149,7 @@ try {
            "?`$filter=RecipientTypeDetails eq 'UserMailbox'" +
            "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName," +
            "ProhibitSendQuota,ArchiveStatus,ArchiveQuota,AutoExpandingArchiveEnabled," +
-           "RetentionPolicy,RetentionHoldEnabled,LitigationHoldEnabled,LitigationHoldDuration" +
+           "RetentionPolicy,RetentionHoldEnabled,LitigationHoldEnabled,LitigationHoldDuration,ArchiveGuid" +
            "&`$top=1000"
     do {
         $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers $exoHeaders -Method GET }
@@ -170,8 +176,14 @@ try {
                                               $raw = $_.LitigationHoldDuration.ToString()
                                               if ($raw -match '^(\d+)\.') { [int]$Matches[1] } else { $raw }
                                           } else { $null }
+            ArchiveGuid                 = if ($_.PSObject.Properties['ArchiveGuid'] -and $_.ArchiveGuid) { $_.ArchiveGuid.ToString() } else { $null }
         }
     })
+
+    $archiveGuidByEOID = @{}
+    foreach ($mbx in $allMailboxes) {
+        if ($mbx.ArchiveGuid) { $archiveGuidByEOID[$mbx.EOID] = $mbx.ArchiveGuid }
+    }
 
     # ── Phase 2: Reports API usage stats ──────────────────────────────────────
     Write-Log "Fetching mailbox usage report via Graph Reports API (period=$ReportsPeriod, data 24-48h stale)..." "WARN"
@@ -251,18 +263,29 @@ try {
         Write-Log "$($gaps.Count) mailbox(es) not in Reports API (new <48h or privacy-hidden) — fetching live stats via EXO REST..." "WARN"
         foreach ($mbx in $gaps) {
             try {
-                $stats       = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($mbx.EOID)')/MailboxStatistics" -Headers $exoHeaders -Method GET }
+                $statsResp   = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($mbx.EOID)')/Exchange.GetMailboxStatistics" -Headers $exoHeaders -Method GET }
+                $stats       = if ($statsResp.PSObject.Properties['value']) { $statsResp.value | Select-Object -First 1 } else { $statsResp }
                 $usedMB      = ConvertTo-MB $stats.TotalItemSize
                 $quotaMB     = $mbx.QuotaMBComputed
                 $pct         = Get-UsagePercent -UsedMB $usedMB -QuotaMB $quotaMB
                 $archEnabled = ($mbx.ArchiveStatus -eq 'Active')
                 $archUsedMB  = $null; $archUsedGB = $null
                 if ($archEnabled) {
+                    $archGuid = $mbx.ArchiveGuid
                     try {
-                        $archStats  = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($mbx.EOID)')/ArchiveMailboxStatistics" -Headers $exoHeaders -Method GET }
-                        $archUsedMB = ConvertTo-MB $archStats.TotalItemSize
+                        if (-not $archGuid) { throw "No ArchiveGuid in Phase 1 data" }
+                        $archResp   = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$archGuid')/Exchange.GetMailboxStatistics" -Headers $exoHeaders -Method GET }
+                        $archItem   = if ($archResp.PSObject.Properties['value']) { $archResp.value | Select-Object -First 1 } else { $archResp }
+                        $archUsedMB = ConvertTo-MB $archItem.TotalItemSize
                         $archUsedGB = [math]::Round($archUsedMB / 1024, 3)
-                    } catch { $archUsedMB = -1; $archUsedGB = -1 }
+                    } catch {
+                        if ($_ -match '404') {
+                            $archUsedMB = 0; $archUsedGB = 0
+                        } else {
+                            Write-Log "Archive stats fetch failed for $($mbx.UserPrincipalName): $_" "WARN"
+                            $archUsedMB = -1; $archUsedGB = -1
+                        }
+                    }
                 }
                 $results.Add([PSCustomObject]@{
                     EOID                        = $mbx.EOID
@@ -317,36 +340,53 @@ try {
             $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
         }
 
-        $p_token    = $exoToken
-        $p_tenantId = $tenantId
+        $p_token        = $exoToken
+        $p_tenantId     = $tenantId
+        $p_archiveGuids = $archiveGuidByEOID
 
         # Parallel fetch — ForEach-Object -Parallel returns new objects; mutating $_ inside
         # the block does not propagate back. Collect (EOID, stats) then join in parent scope.
         $archiveStatsList = $archiveRows | ForEach-Object -Parallel {
-            $eoid  = $_.EOID
-            $token = $using:p_token
-            $tid   = $using:p_tenantId
+            $eoid      = $_.EOID
+            $token     = $using:p_token
+            $tid       = $using:p_tenantId
+            $archGuids = $using:p_archiveGuids
+            $archGuid  = $archGuids[$eoid]
 
-            $usedMB = -1; $usedGB = -1
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-                try {
-                    $resp = Invoke-RestMethod `
-                        -Uri     "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$eoid')/ArchiveMailboxStatistics" `
-                        -Headers @{ Authorization = "Bearer $token" } `
-                        -Method  GET
-                    $s = $resp.TotalItemSize
-                    $usedMB = if     ($null -eq $s)                                            { 0 }
-                              elseif ($s -is [long] -or $s -is [int] -or $s -is [double])     { [math]::Round([double]$s / 1MB, 2) }
-                              elseif ($s.ToString() -match '\(([0-9,]+) bytes\)')              { [math]::Round([long]($Matches[1] -replace ',', '') / 1MB, 2) }
-                              else   { $p = 0L; if ([long]::TryParse($s.ToString(), [ref]$p)) { [math]::Round($p / 1MB, 2) } else { 0 } }
-                    $usedGB = [math]::Round($usedMB / 1024, 3)
-                    break
-                } catch {
-                    if ($attempt -ge 3 -or $_.Exception.Message -notmatch '429|throttl') { break }
-                    Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+            $usedMB = -1; $usedGB = -1; $fetchErr = $null
+            if (-not $archGuid) {
+                $fetchErr = "No ArchiveGuid in Phase 1 data"
+            } else {
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                    try {
+                        $resp = Invoke-RestMethod `
+                            -Uri     "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$archGuid')/Exchange.GetMailboxStatistics" `
+                            -Headers @{ Authorization = "Bearer $token" } `
+                            -Method  GET
+                        $item = if ($resp.PSObject.Properties['value']) { $resp.value | Select-Object -First 1 } else { $resp }
+                        $s = $item.TotalItemSize
+                        $usedMB = if     ($null -eq $s)                                            { 0 }
+                                  elseif ($s -is [long] -or $s -is [int] -or $s -is [double])     { [math]::Round([double]$s / 1MB, 2) }
+                                  elseif ($s.ToString() -match '\(([0-9,]+) bytes\)')              { [math]::Round([long]($Matches[1] -replace ',', '') / 1MB, 2) }
+                                  else   { $p = 0L; if ([long]::TryParse($s.ToString(), [ref]$p)) { [math]::Round($p / 1MB, 2) } else { 0 } }
+                        $usedGB = [math]::Round($usedMB / 1024, 3)
+                        break
+                    } catch {
+                        $msg = $_.Exception.Message
+                        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg = "$msg — $($_.ErrorDetails.Message)" }
+                        if ($msg -match '404') {
+                            $usedMB = 0; $usedGB = 0
+                            break
+                        }
+                        if ($attempt -ge 3 -or $msg -notmatch '429|throttl') {
+                            $fetchErr = "(attempt $attempt/3) $msg"
+                            break
+                        }
+                        Start-Sleep -Seconds ([math]::Pow(2, $attempt))
+                    }
                 }
             }
-            [PSCustomObject]@{ EOID = $eoid; ArchiveUsedMB = $usedMB; ArchiveUsedGB = $usedGB }
+            [PSCustomObject]@{ EOID = $eoid; ArchiveUsedMB = $usedMB; ArchiveUsedGB = $usedGB; FetchError = $fetchErr }
         } -ThrottleLimit 8
 
         # Join stats back to $results by EOID (parent-scope object refs are still valid here)
@@ -355,6 +395,17 @@ try {
         foreach ($row in $archiveRows) {
             $s = $archiveLookup[$row.EOID]
             if ($s) { $row.ArchiveUsedMB = $s.ArchiveUsedMB; $row.ArchiveUsedGB = $s.ArchiveUsedGB }
+        }
+
+        $archiveErrors = 0
+        foreach ($s in $archiveStatsList) {
+            if ($s -and $s.ArchiveUsedMB -eq -1) {
+                $archiveErrors++
+                Write-Log "Archive stats failed for $($s.EOID): $($s.FetchError)" "WARN"
+            }
+        }
+        if ($archiveErrors -gt 0) {
+            Write-Log "$archiveErrors of $($archiveRows.Count) archive stat fetch(es) failed (ArchiveUsedMB = -1)." "WARN"
         }
     }
 
@@ -379,10 +430,10 @@ try {
         -ExpiryTime (Get-Date).AddHours(24) `
         -Context    $storageCtx `
         -FullUri
-    Write-Log "SAS URL (24h): generated." "SUCCESS"
+    Write-Log "SAS URL (24h): generated." "DEBUG"
 
     # ── Trigger Send-ReportNotification ───────────────────────────────────────
-    Write-Log "Triggering Send-ReportNotification..."
+    Write-Log "Triggering Send-ReportNotification..." "DEBUG"
     Start-AzAutomationRunbook `
         -ResourceGroupName     $repAccountRG `
         -AutomationAccountName $repAccountName `
@@ -393,7 +444,7 @@ try {
             RowCount         = $results.Count
             SendAsAttachment = $SendAsAttachment
         } | Out-Null
-    Write-Log "Send-ReportNotification triggered." "SUCCESS"
+    Write-Log "Send-ReportNotification triggered." "DEBUG"
 
 } catch {
     Write-Log "Script failed: $_" "ERROR"
