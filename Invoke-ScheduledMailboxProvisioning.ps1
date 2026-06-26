@@ -202,6 +202,22 @@ try {
     $tokenAcquiredAt = Get-Date
     Write-Log "EXO admin token acquired." "DEBUG"
 
+    # Org-level AutoExpandingArchiveEnabled: when true, mailbox-level is read-only — PATCH
+    # returns "Readonly field AutoExpandingArchiveEnabled" for every mailbox. Detect this once
+    # to skip the per-mailbox calls entirely and avoid misleading "Already enabled (no-op)" output.
+    $orgAutoExpand = $false
+    try {
+        $orgCfg = Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/OrganizationConfig" -Headers @{ Authorization = "Bearer $exoToken" } -Method GET
+        if ($orgCfg.PSObject.Properties['AutoExpandingArchiveEnabled']) {
+            $orgAutoExpand = [bool]$orgCfg.AutoExpandingArchiveEnabled
+        }
+        if ($orgAutoExpand -and -not $SkipAutoExpand) {
+            Write-Log "Org-level AutoExpandingArchiveEnabled is ON — skipping per-mailbox auto-expand (effective for all mailboxes)."
+        }
+    } catch {
+        Write-Log "OrganizationConfig unavailable — will attempt per-mailbox auto-expand check. Detail: $_" "DEBUG"
+    }
+
     # Fetch current mailbox state via EXO Admin REST (replaces Graph enumeration)
     # Gets ArchiveStatus, AutoExpandingArchiveEnabled, RetentionPolicy in the same bulk call —
     # used for both pre-flight filtering and skipping no-op API calls per mailbox.
@@ -233,7 +249,7 @@ try {
     $users = @($allMailboxes | Where-Object {
         $m = $_
         (-not $SkipArchive         -and $m.ArchiveStatus -ne 'Active') -or
-        (-not $SkipAutoExpand      -and -not [bool]$m.AutoExpandingArchiveEnabled) -or
+        (-not $SkipAutoExpand      -and -not $orgAutoExpand -and -not [bool]$m.AutoExpandingArchiveEnabled) -or
         (-not $SkipRetentionPolicy -and $m.RetentionPolicy -ne $retentionPolicyName) -or
         (-not $SkipLitigationHold  -and -not [bool]$m.LitigationHoldEnabled)
     })
@@ -253,6 +269,7 @@ try {
     $p_skipRetention   = [bool]$SkipRetentionPolicy
     $p_skipLitHold     = [bool]$SkipLitigationHold
     $p_litHoldDuration = $litigationHoldDuration
+    $p_orgAutoExpand   = $orgAutoExpand
 
     $results = [System.Collections.Generic.List[object]]::new()
     $users | ForEach-Object -Parallel {
@@ -266,6 +283,7 @@ try {
         $skipRetention   = $using:p_skipRetention
         $skipLitHold     = $using:p_skipLitHold
         $litHoldDuration = $using:p_litHoldDuration
+        $orgAE           = $using:p_orgAutoExpand
 
         # Self-contained HTTP helper — no dependency on outer-scope functions.
         # Creates a fresh HttpClient per call (thread-safe); handles EXO no-op responses.
@@ -326,7 +344,7 @@ try {
 
         # 2 ── Auto-Expanding Archive ──────────────────────────────────────────
         if (-not $skipAutoExpand) {
-            if ([bool]$user.AutoExpandingArchiveEnabled) {
+            if ($orgAE -or [bool]$user.AutoExpandingArchiveEnabled) {
                 $autoExpandResult = "Already enabled (no-op)"
             } else {
                 try {

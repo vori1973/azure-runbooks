@@ -142,6 +142,20 @@ try {
     $tokenAcquiredAt = Get-Date
     Write-Log "EXO admin token acquired." "DEBUG"
 
+    # Org-level AutoExpandingArchiveEnabled: when enabled at org level, the mailbox-level
+    # property is read-only and always returns false regardless of effective state.
+    # Fetch once here so Phase 1 can compute the correct effective value.
+    $orgAutoExpand = $false
+    try {
+        $orgCfg = Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/OrganizationConfig" -Headers $exoHeaders -Method GET
+        if ($orgCfg.PSObject.Properties['AutoExpandingArchiveEnabled']) {
+            $orgAutoExpand = [bool]$orgCfg.AutoExpandingArchiveEnabled
+        }
+        if ($orgAutoExpand) { Write-Log "Org-level AutoExpandingArchiveEnabled is ON — effective value will be True for all mailboxes." }
+    } catch {
+        Write-Log "OrganizationConfig unavailable — AutoExpandingArchiveEnabled reflects mailbox-level value only. Detail: $_" "DEBUG"
+    }
+
     # ── Phase 1: EXO metadata via Admin REST API ───────────────────────────────
     Write-Log "Retrieving mailbox metadata via EXO Admin REST API..."
     $rawMailboxes = [System.Collections.Generic.List[object]]::new()
@@ -168,7 +182,7 @@ try {
             QuotaMBComputed             = $qmb
             ArchiveQuotaMBComputed      = $aqmb
             ArchiveStatus               = $_.ArchiveStatus
-            AutoExpandingArchiveEnabled = if ($_.PSObject.Properties['AutoExpandingArchiveEnabled']) { [bool]$_.AutoExpandingArchiveEnabled } else { $false }
+            AutoExpandingArchiveEnabled = $orgAutoExpand -or ($_.PSObject.Properties['AutoExpandingArchiveEnabled'] -and [bool]$_.AutoExpandingArchiveEnabled)
             RetentionPolicy             = if ($_.PSObject.Properties['RetentionPolicy']) { $_.RetentionPolicy } else { $null }
             RetentionHoldEnabled        = if ($_.PSObject.Properties['RetentionHoldEnabled']) { [bool]$_.RetentionHoldEnabled } else { $false }
             LitigationHoldEnabled       = if ($_.PSObject.Properties['LitigationHoldEnabled']) { [bool]$_.LitigationHoldEnabled } else { $false }
