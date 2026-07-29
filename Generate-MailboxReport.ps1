@@ -163,7 +163,8 @@ try {
            "?`$filter=RecipientTypeDetails eq 'UserMailbox'" +
            "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName," +
            "ProhibitSendQuota,ArchiveStatus,ArchiveQuota,AutoExpandingArchiveEnabled," +
-           "RetentionPolicy,RetentionHoldEnabled,LitigationHoldEnabled,LitigationHoldDuration,ArchiveGuid" +
+           "RetentionPolicy,RetentionHoldEnabled,LitigationHoldEnabled,LitigationHoldDuration,ArchiveGuid," +
+           "WhenMailboxCreated" +
            "&`$top=1000"
     do {
         $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers $exoHeaders -Method GET }
@@ -191,6 +192,7 @@ try {
                                               if ($raw -match '^(\d+)\.') { [int]$Matches[1] } else { $raw }
                                           } else { $null }
             ArchiveGuid                 = if ($_.PSObject.Properties['ArchiveGuid'] -and $_.ArchiveGuid) { $_.ArchiveGuid.ToString() } else { $null }
+            WhenMailboxCreated          = if ($_.PSObject.Properties['WhenMailboxCreated'] -and $_.WhenMailboxCreated) { $_.WhenMailboxCreated.ToString() } else { $null }
         }
     })
 
@@ -264,6 +266,7 @@ try {
                 RetentionHoldEnabled        = $mbx.RetentionHoldEnabled
                 LitigationHoldEnabled       = $mbx.LitigationHoldEnabled
                 LitigationHoldDuration      = $mbx.LitigationHoldDuration
+                WhenMailboxCreated          = $mbx.WhenMailboxCreated
                 Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
                 Timestamp                   = $ts
             })
@@ -325,6 +328,7 @@ try {
                     RetentionHoldEnabled        = $mbx.RetentionHoldEnabled
                     LitigationHoldEnabled       = $mbx.LitigationHoldEnabled
                     LitigationHoldDuration      = $mbx.LitigationHoldDuration
+                    WhenMailboxCreated          = $mbx.WhenMailboxCreated
                     Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
                     Timestamp                   = $ts
                 })
@@ -337,6 +341,7 @@ try {
                     ArchiveUsedMB = $null; ArchiveUsedGB = $null; ArchiveQuotaMB = 0; ArchiveQuotaGB = 0
                     RetentionPolicy = $null; RetentionHoldEnabled = $false
                     LitigationHoldEnabled = $false; LitigationHoldDuration = $null
+                    WhenMailboxCreated = $mbx.WhenMailboxCreated
                     Status = 'ERROR'; Timestamp = $ts
                 })
             }
