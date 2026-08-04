@@ -9,8 +9,8 @@
       Phase 1 — EXO Admin REST API for mailbox metadata (no module required)
       Phase 2 — Graph getMailboxUsageDetail report for bulk usage stats (24-48h stale)
       Phase 3 — Join metadata + usage by UPN
-      Phase 4 — Gap fill: live EXO Admin REST for mailboxes missing from report
-      Phase 5 — Archive stats for report-matched mailboxes with active archives
+      Phase 4 — Gap fill (parallel, ThrottleLimit=8): live EXO Admin REST for mailboxes missing from report
+      Phase 5 — Archive stats for report-matched mailboxes with active archives (parallel, ThrottleLimit=8)
     Exports final CSV, uploads to Blob Storage, generates 24-hour SAS URL,
     and calls Send-ReportNotification via Start-AzAutomationRunbook.
 
@@ -275,36 +275,79 @@ try {
         }
     }
 
-    # ── Phase 4: Gap fill via live EXO Admin REST API ─────────────────────────
+    # ── Phase 4: Gap fill via live EXO Admin REST API (parallel) ──────────────
     if ($gaps.Count -gt 0) {
-        Write-Log "$($gaps.Count) mailbox(es) not in Reports API (new <48h or privacy-hidden) — fetching live stats via EXO REST..." "WARN"
-        foreach ($mbx in $gaps) {
+        Write-Log "$($gaps.Count) mailbox(es) not in Reports API (new <48h or privacy-hidden) — fetching live stats via EXO REST (parallel, ThrottleLimit=8)..." "WARN"
+
+        # Refresh EXO token if it has been running long (Phase 1-3 can take time at scale)
+        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
+            Write-Log "Refreshing EXO token before gap-fill collection..."
+            $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $tokenAcquiredAt = Get-Date
+        }
+
+        $p_token    = $exoToken
+        $p_tenantId = $tenantId
+        $p_ts       = $ts
+
+        $gapResults = $gaps | ForEach-Object -Parallel {
+            $mbx  = $_
+            $tid  = $using:p_tenantId
+            $tok  = $using:p_token
+            $rts  = $using:p_ts
+            $hdrs = @{ Authorization = "Bearer $tok" }
+
+            function local:ConvertTo-MBValue {
+                param([object]$Size)
+                if ($null -eq $Size) { return 0 }
+                if ($Size -is [long] -or $Size -is [int] -or $Size -is [double]) { return [math]::Round([double]$Size / 1MB, 2) }
+                if ($Size.ToString() -match '\(([0-9,]+) bytes\)') { return [math]::Round([long]($Matches[1] -replace ',', '') / 1MB, 2) }
+                $parsed = 0L
+                if ([long]::TryParse($Size.ToString(), [ref]$parsed)) { return [math]::Round($parsed / 1MB, 2) }
+                return 0
+            }
+
+            function local:Invoke-RestWithRetry {
+                param([string]$Uri, [int]$MaxRetries = 3)
+                $attempt = 0
+                while ($true) {
+                    try { return Invoke-RestMethod -Uri $Uri -Headers $hdrs -Method GET }
+                    catch {
+                        $msg = $_.Exception.Message
+                        $attempt++
+                        if ($attempt -ge $MaxRetries) { throw }
+                        if ($msg -match '429|throttl|too many|exceeded|transient') {
+                            Start-Sleep -Seconds ([math]::Pow(2, $attempt) + (Get-Random -Minimum 1 -Maximum 5))
+                        } else { throw }
+                    }
+                }
+            }
+
             try {
-                $statsResp   = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($mbx.EOID)')/Exchange.GetMailboxStatistics" -Headers $exoHeaders -Method GET }
+                $statsResp   = Invoke-RestWithRetry -Uri "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$($mbx.EOID)')/Exchange.GetMailboxStatistics"
                 $stats       = if ($statsResp.PSObject.Properties['value']) { $statsResp.value | Select-Object -First 1 } else { $statsResp }
-                $usedMB      = ConvertTo-MB $stats.TotalItemSize
+                $usedMB      = ConvertTo-MBValue $stats.TotalItemSize
                 $quotaMB     = $mbx.QuotaMBComputed
-                $pct         = Get-UsagePercent -UsedMB $usedMB -QuotaMB $quotaMB
+                $pct         = if ($quotaMB -le 0) { 0 } else { [math]::Round(($usedMB / $quotaMB) * 100, 2) }
                 $archEnabled = ($mbx.ArchiveStatus -eq 'Active')
                 $archUsedMB  = $null; $archUsedGB = $null
                 if ($archEnabled) {
                     $archGuid = $mbx.ArchiveGuid
                     try {
                         if (-not $archGuid) { throw "No ArchiveGuid in Phase 1 data" }
-                        $archResp   = Invoke-WithRetry { Invoke-RestMethod -Uri "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$archGuid')/Exchange.GetMailboxStatistics" -Headers $exoHeaders -Method GET }
+                        $archResp   = Invoke-RestWithRetry -Uri "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$archGuid')/Exchange.GetMailboxStatistics"
                         $archItem   = if ($archResp.PSObject.Properties['value']) { $archResp.value | Select-Object -First 1 } else { $archResp }
-                        $archUsedMB = ConvertTo-MB $archItem.TotalItemSize
+                        $archUsedMB = ConvertTo-MBValue $archItem.TotalItemSize
                         $archUsedGB = [math]::Round($archUsedMB / 1024, 3)
                     } catch {
                         if ($_ -match '404') {
                             $archUsedMB = 0; $archUsedGB = 0
                         } else {
-                            Write-Log "Archive stats fetch failed for $($mbx.UserPrincipalName): $_" "WARN"
                             $archUsedMB = -1; $archUsedGB = -1
                         }
                     }
                 }
-                $results.Add([PSCustomObject]@{
+                [PSCustomObject]@{
                     EOID                        = $mbx.EOID
                     DisplayName                 = $mbx.DisplayName
                     UPN                         = $mbx.UserPrincipalName
@@ -315,7 +358,7 @@ try {
                     UsagePercent                = $pct
                     ItemCount                   = if ($stats.PSObject.Properties['ItemCount']) { $stats.ItemCount } else { 0 }
                     DeletedItemCount            = if ($stats.PSObject.Properties['DeletedItemCount']) { $stats.DeletedItemCount } else { 0 }
-                    DeletedItemSizeMB           = ConvertTo-MB $stats.TotalDeletedItemSize
+                    DeletedItemSizeMB           = ConvertTo-MBValue $stats.TotalDeletedItemSize
                     LastActivityDate            = if ($stats.PSObject.Properties['LastLogonTime']) { $stats.LastLogonTime } else { $null }
                     ArchiveStatus               = $mbx.ArchiveStatus
                     ArchiveEnabled              = $archEnabled
@@ -330,10 +373,10 @@ try {
                     LitigationHoldDuration      = $mbx.LitigationHoldDuration
                     WhenMailboxCreated          = $mbx.WhenMailboxCreated
                     Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
-                    Timestamp                   = $ts
-                })
+                    Timestamp                   = $rts
+                }
             } catch {
-                $results.Add([PSCustomObject]@{
+                [PSCustomObject]@{
                     EOID = $mbx.EOID; DisplayName = $mbx.DisplayName; UPN = $mbx.UserPrincipalName
                     UsedMB = -1; UsedGB = -1; QuotaMB = -1; QuotaGB = -1; UsagePercent = -1
                     ItemCount = $null; DeletedItemCount = $null; DeletedItemSizeMB = $null; LastActivityDate = $null
@@ -342,9 +385,16 @@ try {
                     RetentionPolicy = $null; RetentionHoldEnabled = $false
                     LitigationHoldEnabled = $false; LitigationHoldDuration = $null
                     WhenMailboxCreated = $mbx.WhenMailboxCreated
-                    Status = 'ERROR'; Timestamp = $ts
-                })
+                    Status = 'ERROR'; Timestamp = $rts
+                }
             }
+        } -ThrottleLimit 8
+
+        foreach ($r in $gapResults) { if ($r) { $results.Add($r) } }
+
+        $gapErrors = @($gapResults | Where-Object { $_.Status -eq 'ERROR' }).Count
+        if ($gapErrors -gt 0) {
+            Write-Log "$gapErrors of $($gaps.Count) gap-fill mailbox(es) failed (Status = ERROR)." "WARN"
         }
     }
 
