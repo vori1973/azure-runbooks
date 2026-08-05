@@ -9,8 +9,18 @@
       Phase 1 — EXO Admin REST API for mailbox metadata (no module required)
       Phase 2 — Graph getMailboxUsageDetail report for bulk usage stats (24-48h stale)
       Phase 3 — Join metadata + usage by UPN
-      Phase 4 — Gap fill (parallel, ThrottleLimit=8): live EXO Admin REST for mailboxes missing from report
-      Phase 5 — Archive stats for report-matched mailboxes with active archives (parallel, ThrottleLimit=8)
+      Phase 4 — Gap fill (async, concurrency=8): live EXO Admin REST for mailboxes missing from report
+      Phase 5 — Archive stats for report-matched mailboxes with active archives (async, concurrency=8)
+
+    Phases 4 and 5 issue many independent EXO REST calls. They use a single shared
+    HttpClient with bounded concurrency (Invoke-ThrottledGet, below) rather than
+    ForEach-Object -Parallel — the latter allocates a full PowerShell runspace per
+    concurrent item, which is fine at a few hundred items but causes
+    System.OutOfMemoryException in the Azure Automation cloud sandbox once mailbox
+    counts reach into the thousands. Invoke-ThrottledGet runs entirely on the single
+    calling runspace and only overlaps network I/O, so memory stays flat regardless
+    of how many mailboxes are processed.
+
     Exports final CSV, uploads to Blob Storage, generates 24-hour SAS URL,
     and calls Send-ReportNotification via Start-AzAutomationRunbook.
 
@@ -87,6 +97,27 @@ function Get-UsagePercent {
     return [math]::Round(($UsedMB / $QuotaMB) * 100, 2)
 }
 
+function Get-JsonProp {
+    # Null-safe property read: a 2xx response with an empty body parses to $null via
+    # ConvertFrom-Json, and Set-StrictMode throws on ANY property access against $null
+    # (including .PSObject.Properties itself) — this centralizes the null/missing check.
+    param([object]$Obj, [string]$Name)
+    if ($null -eq $Obj) { return $null }
+    if ($Obj.PSObject.Properties[$Name]) { return $Obj.$Name }
+    return $null
+}
+
+function ConvertFrom-StatsJson {
+    # Parses an EXO Admin REST response body and unwraps the OData 'value' array if
+    # present. Returns $null for an empty/whitespace body instead of throwing.
+    param([string]$Json)
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $null }
+    $parsed = ConvertFrom-Json $Json
+    $item = Get-JsonProp $parsed 'value'
+    if ($item) { return ($item | Select-Object -First 1) }
+    return $parsed
+}
+
 function Invoke-WithRetry {
     param([scriptblock]$ScriptBlock, [int]$MaxRetries = 5)
     $attempt = 0
@@ -103,6 +134,109 @@ function Invoke-WithRetry {
             } else { throw }
         }
     }
+}
+
+function Invoke-ThrottledGet {
+    <#
+        Issues many GET requests concurrently through a single shared HttpClient,
+        bounded to MaxConcurrency requests in flight at a time, using .NET's async
+        Task APIs directly (Task.WaitAny over the in-flight set). Everything runs on
+        the calling runspace — no extra PowerShell runspaces are created, so memory
+        stays flat no matter how many items are queued. This replaces
+        ForEach-Object -Parallel, which allocates one runspace per concurrent item
+        and exhausts the Azure Automation sandbox's memory ceiling at scale.
+
+        -Items must be objects with .Key (a unique string used to look up the result)
+        and .Uri properties. Returns a Dictionary<string,object> keyed by .Key, where
+        each value is @{ Success; StatusCode; Body; Error }.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Items,
+        [Parameter(Mandatory)][string]$BearerToken,
+        [int]$MaxConcurrency = 8,
+        [int]$MaxRetries = 3,
+        [string]$ProgressActivity = $null,
+        [int]$ProgressEvery = 1000
+    )
+
+    $results = [System.Collections.Generic.Dictionary[string, object]]::new()
+    if ($Items.Count -eq 0) { return $results }
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds(100)
+    $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $BearerToken)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        foreach ($it in $Items) { $queue.Enqueue([PSCustomObject]@{ Key = $it.Key; Uri = $it.Uri; Attempt = 0 }) }
+        $total = $queue.Count
+        $done  = 0
+
+        $inFlight  = [System.Collections.Generic.Dictionary[object, object]]::new()
+        $startNext = {
+            if ($queue.Count -gt 0) {
+                $work = $queue.Dequeue()
+                $inFlight[$client.GetAsync($work.Uri)] = $work
+            }
+        }
+        for ($i = 0; $i -lt $MaxConcurrency; $i++) { & $startNext }
+
+        while ($inFlight.Count -gt 0) {
+            [System.Threading.Tasks.Task[]]$tasksArr = @($inFlight.Keys)
+            $idx      = [System.Threading.Tasks.Task]::WaitAny($tasksArr)
+            $doneTask = $tasksArr[$idx]
+            $work     = $inFlight[$doneTask]
+            [void]$inFlight.Remove($doneTask)
+
+            $statusCode     = -1
+            $body           = $null
+            $errMsg         = $null
+            $transportError = $false
+            try {
+                $resp       = $doneTask.GetAwaiter().GetResult()
+                $statusCode = [int]$resp.StatusCode
+                $body       = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                $resp.Dispose()
+            } catch {
+                $errMsg         = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                $transportError = $true
+            }
+
+            $finish = $false
+            if (-not $transportError -and $statusCode -ge 200 -and $statusCode -lt 300) {
+                $results[$work.Key] = [PSCustomObject]@{ Success = $true; StatusCode = $statusCode; Body = $body; Error = $null }
+                $finish = $true
+            } elseif (-not $transportError -and $statusCode -eq 404) {
+                $results[$work.Key] = [PSCustomObject]@{ Success = $false; StatusCode = 404; Body = $null; Error = 'NotFound' }
+                $finish = $true
+            } else {
+                if (-not $errMsg) { $errMsg = "HTTP $statusCode" }
+                $retryable = $transportError -or $statusCode -eq 429 -or $statusCode -ge 500
+                if ($retryable -and $work.Attempt -lt $MaxRetries) {
+                    $work.Attempt++
+                    Start-Sleep -Seconds ([math]::Min(([math]::Pow(2, $work.Attempt) + (Get-Random -Minimum 1 -Maximum 5)), 20))
+                    $inFlight[$client.GetAsync($work.Uri)] = $work
+                } else {
+                    $results[$work.Key] = [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Body = $null; Error = "(attempt $($work.Attempt + 1)) $errMsg" }
+                    $finish = $true
+                }
+            }
+
+            if ($finish) {
+                & $startNext
+                $done++
+                if ($ProgressActivity -and ($done % $ProgressEvery -eq 0 -or $done -eq $total)) {
+                    $tsNow = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    Write-Host "[$tsNow] [INFO] $ProgressActivity - $done / $total ($([math]::Round($sw.Elapsed.TotalSeconds))s elapsed)"
+                }
+            }
+        }
+    } finally {
+        $client.Dispose()
+    }
+
+    return $results
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -275,9 +409,9 @@ try {
         }
     }
 
-    # ── Phase 4: Gap fill via live EXO Admin REST API (parallel) ──────────────
+    # ── Phase 4: Gap fill via live EXO Admin REST API (async, concurrency=8) ──
     if ($gaps.Count -gt 0) {
-        Write-Log "$($gaps.Count) mailbox(es) not in Reports API (new <48h or privacy-hidden) — fetching live stats via EXO REST (parallel, ThrottleLimit=8)..." "WARN"
+        Write-Log "$($gaps.Count) mailbox(es) not in Reports API (new <48h or privacy-hidden) — fetching live stats via EXO REST (async, concurrency=8)..." "WARN"
 
         # Refresh EXO token if it has been running long (Phase 1-3 can take time at scale)
         if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
@@ -286,97 +420,26 @@ try {
             $tokenAcquiredAt = Get-Date
         }
 
-        $p_token    = $exoToken
-        $p_tenantId = $tenantId
-        $p_ts       = $ts
+        $mainItems = foreach ($mbx in $gaps) {
+            [PSCustomObject]@{ Key = $mbx.EOID; Uri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($mbx.EOID)')/Exchange.GetMailboxStatistics" }
+        }
+        $mainStats = Invoke-ThrottledGet -Items $mainItems -BearerToken $exoToken -MaxConcurrency 8 -ProgressActivity "Phase 4 gap-fill mailbox stats"
 
-        $gapResults = $gaps | ForEach-Object -Parallel {
-            $mbx  = $_
-            $tid  = $using:p_tenantId
-            $tok  = $using:p_token
-            $rts  = $using:p_ts
-            $hdrs = @{ Authorization = "Bearer $tok" }
-
-            function local:ConvertTo-MBValue {
-                param([object]$Size)
-                if ($null -eq $Size) { return 0 }
-                if ($Size -is [long] -or $Size -is [int] -or $Size -is [double]) { return [math]::Round([double]$Size / 1MB, 2) }
-                if ($Size.ToString() -match '\(([0-9,]+) bytes\)') { return [math]::Round([long]($Matches[1] -replace ',', '') / 1MB, 2) }
-                $parsed = 0L
-                if ([long]::TryParse($Size.ToString(), [ref]$parsed)) { return [math]::Round($parsed / 1MB, 2) }
-                return 0
+        $archiveCandidates = @($gaps | Where-Object { $_.ArchiveStatus -eq 'Active' -and $_.ArchiveGuid })
+        $archStats = @{}
+        if ($archiveCandidates.Count -gt 0) {
+            $archItems = foreach ($mbx in $archiveCandidates) {
+                [PSCustomObject]@{ Key = $mbx.EOID; Uri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$($mbx.ArchiveGuid)')/Exchange.GetMailboxStatistics" }
             }
+            $archStats = Invoke-ThrottledGet -Items $archItems -BearerToken $exoToken -MaxConcurrency 8 -ProgressActivity "Phase 4 gap-fill archive stats"
+        }
 
-            function local:Invoke-RestWithRetry {
-                param([string]$Uri, [int]$MaxRetries = 3)
-                $attempt = 0
-                while ($true) {
-                    try { return Invoke-RestMethod -Uri $Uri -Headers $hdrs -Method GET }
-                    catch {
-                        $msg = $_.Exception.Message
-                        $attempt++
-                        if ($attempt -ge $MaxRetries) { throw }
-                        if ($msg -match '429|throttl|too many|exceeded|transient') {
-                            Start-Sleep -Seconds ([math]::Pow(2, $attempt) + (Get-Random -Minimum 1 -Maximum 5))
-                        } else { throw }
-                    }
-                }
-            }
-
-            try {
-                $statsResp   = Invoke-RestWithRetry -Uri "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$($mbx.EOID)')/Exchange.GetMailboxStatistics"
-                $stats       = if ($statsResp.PSObject.Properties['value']) { $statsResp.value | Select-Object -First 1 } else { $statsResp }
-                $usedMB      = ConvertTo-MBValue $stats.TotalItemSize
-                $quotaMB     = $mbx.QuotaMBComputed
-                $pct         = if ($quotaMB -le 0) { 0 } else { [math]::Round(($usedMB / $quotaMB) * 100, 2) }
-                $archEnabled = ($mbx.ArchiveStatus -eq 'Active')
-                $archUsedMB  = $null; $archUsedGB = $null
-                if ($archEnabled) {
-                    $archGuid = $mbx.ArchiveGuid
-                    try {
-                        if (-not $archGuid) { throw "No ArchiveGuid in Phase 1 data" }
-                        $archResp   = Invoke-RestWithRetry -Uri "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$archGuid')/Exchange.GetMailboxStatistics"
-                        $archItem   = if ($archResp.PSObject.Properties['value']) { $archResp.value | Select-Object -First 1 } else { $archResp }
-                        $archUsedMB = ConvertTo-MBValue $archItem.TotalItemSize
-                        $archUsedGB = [math]::Round($archUsedMB / 1024, 3)
-                    } catch {
-                        if ($_ -match '404') {
-                            $archUsedMB = 0; $archUsedGB = 0
-                        } else {
-                            $archUsedMB = -1; $archUsedGB = -1
-                        }
-                    }
-                }
-                [PSCustomObject]@{
-                    EOID                        = $mbx.EOID
-                    DisplayName                 = $mbx.DisplayName
-                    UPN                         = $mbx.UserPrincipalName
-                    UsedMB                      = $usedMB
-                    UsedGB                      = [math]::Round($usedMB  / 1024, 3)
-                    QuotaMB                     = $quotaMB
-                    QuotaGB                     = [math]::Round($quotaMB / 1024, 3)
-                    UsagePercent                = $pct
-                    ItemCount                   = if ($stats.PSObject.Properties['ItemCount']) { $stats.ItemCount } else { 0 }
-                    DeletedItemCount            = if ($stats.PSObject.Properties['DeletedItemCount']) { $stats.DeletedItemCount } else { 0 }
-                    DeletedItemSizeMB           = ConvertTo-MBValue $stats.TotalDeletedItemSize
-                    LastActivityDate            = if ($stats.PSObject.Properties['LastLogonTime']) { $stats.LastLogonTime } else { $null }
-                    ArchiveStatus               = $mbx.ArchiveStatus
-                    ArchiveEnabled              = $archEnabled
-                    AutoExpandingArchiveEnabled = $mbx.AutoExpandingArchiveEnabled
-                    ArchiveUsedMB               = $archUsedMB
-                    ArchiveUsedGB               = $archUsedGB
-                    ArchiveQuotaMB              = $mbx.ArchiveQuotaMBComputed
-                    ArchiveQuotaGB              = if ($mbx.ArchiveQuotaMBComputed -gt 0) { [math]::Round($mbx.ArchiveQuotaMBComputed / 1024, 3) } else { 0 }
-                    RetentionPolicy             = $mbx.RetentionPolicy
-                    RetentionHoldEnabled        = $mbx.RetentionHoldEnabled
-                    LitigationHoldEnabled       = $mbx.LitigationHoldEnabled
-                    LitigationHoldDuration      = $mbx.LitigationHoldDuration
-                    WhenMailboxCreated          = $mbx.WhenMailboxCreated
-                    Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
-                    Timestamp                   = $rts
-                }
-            } catch {
-                [PSCustomObject]@{
+        $gapErrors = 0
+        foreach ($mbx in $gaps) {
+            $main = $mainStats[$mbx.EOID]
+            if (-not $main -or -not $main.Success) {
+                $gapErrors++
+                $results.Add([PSCustomObject]@{
                     EOID = $mbx.EOID; DisplayName = $mbx.DisplayName; UPN = $mbx.UserPrincipalName
                     UsedMB = -1; UsedGB = -1; QuotaMB = -1; QuotaGB = -1; UsagePercent = -1
                     ItemCount = $null; DeletedItemCount = $null; DeletedItemSizeMB = $null; LastActivityDate = $null
@@ -385,23 +448,74 @@ try {
                     RetentionPolicy = $null; RetentionHoldEnabled = $false
                     LitigationHoldEnabled = $false; LitigationHoldDuration = $null
                     WhenMailboxCreated = $mbx.WhenMailboxCreated
-                    Status = 'ERROR'; Timestamp = $rts
+                    Status = 'ERROR'; Timestamp = $ts
+                })
+                continue
+            }
+
+            $stats       = ConvertFrom-StatsJson $main.Body
+            $usedMB      = ConvertTo-MB (Get-JsonProp $stats 'TotalItemSize')
+            $quotaMB     = $mbx.QuotaMBComputed
+            $pct         = Get-UsagePercent -UsedMB $usedMB -QuotaMB $quotaMB
+            $archEnabled = ($mbx.ArchiveStatus -eq 'Active')
+
+            $archUsedMB = $null; $archUsedGB = $null
+            if ($archEnabled) {
+                if (-not $mbx.ArchiveGuid) {
+                    $archUsedMB = -1; $archUsedGB = -1
+                } else {
+                    $a = $archStats[$mbx.EOID]
+                    if ($a -and $a.Success) {
+                        $aItem      = ConvertFrom-StatsJson $a.Body
+                        $archUsedMB = ConvertTo-MB (Get-JsonProp $aItem 'TotalItemSize')
+                        $archUsedGB = [math]::Round($archUsedMB / 1024, 3)
+                    } elseif ($a -and $a.StatusCode -eq 404) {
+                        $archUsedMB = 0; $archUsedGB = 0
+                    } else {
+                        $archUsedMB = -1; $archUsedGB = -1
+                    }
                 }
             }
-        } -ThrottleLimit 8
 
-        foreach ($r in $gapResults) { if ($r) { $results.Add($r) } }
+            $results.Add([PSCustomObject]@{
+                EOID                        = $mbx.EOID
+                DisplayName                 = $mbx.DisplayName
+                UPN                         = $mbx.UserPrincipalName
+                UsedMB                      = $usedMB
+                UsedGB                      = [math]::Round($usedMB  / 1024, 3)
+                QuotaMB                     = $quotaMB
+                QuotaGB                     = [math]::Round($quotaMB / 1024, 3)
+                UsagePercent                = $pct
+                ItemCount                   = $(if ($null -ne (Get-JsonProp $stats 'ItemCount')) { Get-JsonProp $stats 'ItemCount' } else { 0 })
+                DeletedItemCount            = $(if ($null -ne (Get-JsonProp $stats 'DeletedItemCount')) { Get-JsonProp $stats 'DeletedItemCount' } else { 0 })
+                DeletedItemSizeMB           = ConvertTo-MB (Get-JsonProp $stats 'TotalDeletedItemSize')
+                LastActivityDate            = Get-JsonProp $stats 'LastLogonTime'
+                ArchiveStatus               = $mbx.ArchiveStatus
+                ArchiveEnabled              = $archEnabled
+                AutoExpandingArchiveEnabled = $mbx.AutoExpandingArchiveEnabled
+                ArchiveUsedMB               = $archUsedMB
+                ArchiveUsedGB               = $archUsedGB
+                ArchiveQuotaMB              = $mbx.ArchiveQuotaMBComputed
+                ArchiveQuotaGB              = if ($mbx.ArchiveQuotaMBComputed -gt 0) { [math]::Round($mbx.ArchiveQuotaMBComputed / 1024, 3) } else { 0 }
+                RetentionPolicy             = $mbx.RetentionPolicy
+                RetentionHoldEnabled        = $mbx.RetentionHoldEnabled
+                LitigationHoldEnabled       = $mbx.LitigationHoldEnabled
+                LitigationHoldDuration      = $mbx.LitigationHoldDuration
+                WhenMailboxCreated          = $mbx.WhenMailboxCreated
+                Status                      = if ($pct -ge 96) { 'CRITICAL' } elseif ($pct -ge 90) { 'HIGH' } elseif ($pct -ge 80) { 'WARNING' } else { 'OK' }
+                Timestamp                   = $ts
+            })
+        }
 
-        $gapErrors = @($gapResults | Where-Object { $_.Status -eq 'ERROR' }).Count
         if ($gapErrors -gt 0) {
             Write-Log "$gapErrors of $($gaps.Count) gap-fill mailbox(es) failed (Status = ERROR)." "WARN"
         }
     }
 
-    # ── Phase 5: Archive stats for report-matched mailboxes (parallel) ────────
+    # ── Phase 5: Archive stats for report-matched mailboxes (async, concurrency=8) ─
     $archiveRows = @($results | Where-Object { $_.ArchiveEnabled -eq $true -and $null -eq $_.ArchiveUsedMB })
     if ($archiveRows.Count -gt 0) {
-        Write-Log "Fetching archive stats for $($archiveRows.Count) mailbox(es) with active archives (parallel, ThrottleLimit=8)..."
+        Write-Log "Fetching archive stats for $($archiveRows.Count) mailbox(es) with active archives (async, concurrency=8)..."
 
         # Refresh EXO token if it has been running long (Phase 1-4 can take time at scale)
         if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
@@ -409,68 +523,34 @@ try {
             $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
         }
 
-        $p_token        = $exoToken
-        $p_tenantId     = $tenantId
-        $p_archiveGuids = $archiveGuidByEOID
-
-        # Parallel fetch — ForEach-Object -Parallel returns new objects; mutating $_ inside
-        # the block does not propagate back. Collect (EOID, stats) then join in parent scope.
-        $archiveStatsList = $archiveRows | ForEach-Object -Parallel {
-            $eoid      = $_.EOID
-            $token     = $using:p_token
-            $tid       = $using:p_tenantId
-            $archGuids = $using:p_archiveGuids
-            $archGuid  = $archGuids[$eoid]
-
-            $usedMB = -1; $usedGB = -1; $fetchErr = $null
-            if (-not $archGuid) {
-                $fetchErr = "No ArchiveGuid in Phase 1 data"
-            } else {
-                for ($attempt = 1; $attempt -le 3; $attempt++) {
-                    try {
-                        $resp = Invoke-RestMethod `
-                            -Uri     "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$archGuid')/Exchange.GetMailboxStatistics" `
-                            -Headers @{ Authorization = "Bearer $token" } `
-                            -Method  GET
-                        $item = if ($resp.PSObject.Properties['value']) { $resp.value | Select-Object -First 1 } else { $resp }
-                        $s = $item.TotalItemSize
-                        $usedMB = if     ($null -eq $s)                                            { 0 }
-                                  elseif ($s -is [long] -or $s -is [int] -or $s -is [double])     { [math]::Round([double]$s / 1MB, 2) }
-                                  elseif ($s.ToString() -match '\(([0-9,]+) bytes\)')              { [math]::Round([long]($Matches[1] -replace ',', '') / 1MB, 2) }
-                                  else   { $p = 0L; if ([long]::TryParse($s.ToString(), [ref]$p)) { [math]::Round($p / 1MB, 2) } else { 0 } }
-                        $usedGB = [math]::Round($usedMB / 1024, 3)
-                        break
-                    } catch {
-                        $msg = $_.Exception.Message
-                        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg = "$msg — $($_.ErrorDetails.Message)" }
-                        if ($msg -match '404') {
-                            $usedMB = 0; $usedGB = 0
-                            break
-                        }
-                        if ($attempt -ge 3 -or $msg -notmatch '429|throttl') {
-                            $fetchErr = "(attempt $attempt/3) $msg"
-                            break
-                        }
-                        Start-Sleep -Seconds ([math]::Pow(2, $attempt))
-                    }
-                }
-            }
-            [PSCustomObject]@{ EOID = $eoid; ArchiveUsedMB = $usedMB; ArchiveUsedGB = $usedGB; FetchError = $fetchErr }
-        } -ThrottleLimit 8
-
-        # Join stats back to $results by EOID (parent-scope object refs are still valid here)
-        $archiveLookup = @{}
-        foreach ($s in $archiveStatsList) { if ($s) { $archiveLookup[$s.EOID] = $s } }
+        $archItems = [System.Collections.Generic.List[object]]::new()
         foreach ($row in $archiveRows) {
-            $s = $archiveLookup[$row.EOID]
-            if ($s) { $row.ArchiveUsedMB = $s.ArchiveUsedMB; $row.ArchiveUsedGB = $s.ArchiveUsedGB }
+            $archGuid = $archiveGuidByEOID[$row.EOID]
+            if ($archGuid) {
+                $archItems.Add([PSCustomObject]@{ Key = $row.EOID; Uri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$archGuid')/Exchange.GetMailboxStatistics" })
+            }
         }
+        $archiveStats = if ($archItems.Count -gt 0) { Invoke-ThrottledGet -Items $archItems -BearerToken $exoToken -MaxConcurrency 8 -ProgressActivity "Phase 5 archive stats" } else { @{} }
 
         $archiveErrors = 0
-        foreach ($s in $archiveStatsList) {
-            if ($s -and $s.ArchiveUsedMB -eq -1) {
+        foreach ($row in $archiveRows) {
+            if (-not $archiveGuidByEOID[$row.EOID]) {
+                $row.ArchiveUsedMB = -1; $row.ArchiveUsedGB = -1
                 $archiveErrors++
-                Write-Log "Archive stats failed for $($s.EOID): $($s.FetchError)" "WARN"
+                Write-Log "Archive stats failed for $($row.EOID): No ArchiveGuid in Phase 1 data" "WARN"
+                continue
+            }
+            $s = $archiveStats[$row.EOID]
+            if ($s -and $s.Success) {
+                $item = ConvertFrom-StatsJson $s.Body
+                $row.ArchiveUsedMB = ConvertTo-MB (Get-JsonProp $item 'TotalItemSize')
+                $row.ArchiveUsedGB = [math]::Round($row.ArchiveUsedMB / 1024, 3)
+            } elseif ($s -and $s.StatusCode -eq 404) {
+                $row.ArchiveUsedMB = 0; $row.ArchiveUsedGB = 0
+            } else {
+                $row.ArchiveUsedMB = -1; $row.ArchiveUsedGB = -1
+                $archiveErrors++
+                Write-Log "Archive stats failed for $($row.EOID): $(if ($s) { $s.Error } else { 'no response' })" "WARN"
             }
         }
         if ($archiveErrors -gt 0) {
