@@ -125,9 +125,15 @@ function Invoke-WithRetry {
         try { return & $ScriptBlock }
         catch {
             $msg = $_.Exception.Message
+            $response = if ($_.Exception.PSObject.Properties['Response']) { $_.Exception.Response } else { $null }
+            $statusCode = if ($response -and $response.PSObject.Properties['StatusCode']) {
+                [int]$response.StatusCode
+            } else {
+                -1
+            }
             $attempt++
             if ($attempt -ge $MaxRetries) { throw }
-            if ($msg -match '429|throttl|too many|exceeded|transient') {
+            if ($statusCode -eq 429 -or $statusCode -ge 500 -or $msg -match '429|throttl|too many requests|transient') {
                 $wait = [math]::Pow(2, $attempt) + (Get-Random -Minimum 1 -Maximum 5)
                 Write-Log "Transient error — waiting $wait seconds before retry $attempt/$MaxRetries..." "WARN"
                 Start-Sleep -Seconds $wait
@@ -169,7 +175,14 @@ function Invoke-ThrottledGet {
 
     try {
         $queue = [System.Collections.Generic.Queue[object]]::new()
-        foreach ($it in $Items) { $queue.Enqueue([PSCustomObject]@{ Key = $it.Key; Uri = $it.Uri; Attempt = 0 }) }
+        foreach ($it in $Items) {
+            $queue.Enqueue([PSCustomObject]@{
+                Key             = $it.Key
+                Uri             = $it.Uri
+                Attempt         = 0
+                WaitingForRetry = $false
+            })
+        }
         $total = $queue.Count
         $done  = 0
 
@@ -188,6 +201,12 @@ function Invoke-ThrottledGet {
             $doneTask = $tasksArr[$idx]
             $work     = $inFlight[$doneTask]
             [void]$inFlight.Remove($doneTask)
+
+            if ($work.WaitingForRetry) {
+                $work.WaitingForRetry = $false
+                $inFlight[$client.GetAsync($work.Uri)] = $work
+                continue
+            }
 
             $statusCode     = -1
             $body           = $null
@@ -215,8 +234,9 @@ function Invoke-ThrottledGet {
                 $retryable = $transportError -or $statusCode -eq 429 -or $statusCode -ge 500
                 if ($retryable -and $work.Attempt -lt $MaxRetries) {
                     $work.Attempt++
-                    Start-Sleep -Seconds ([math]::Min(([math]::Pow(2, $work.Attempt) + (Get-Random -Minimum 1 -Maximum 5)), 20))
-                    $inFlight[$client.GetAsync($work.Uri)] = $work
+                    $retryDelay = [math]::Min(([math]::Pow(2, $work.Attempt) + (Get-Random -Minimum 1 -Maximum 5)), 20)
+                    $work.WaitingForRetry = $true
+                    $inFlight[[System.Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds($retryDelay))] = $work
                 } else {
                     $results[$work.Key] = [PSCustomObject]@{ Success = $false; StatusCode = $statusCode; Body = $null; Error = "(attempt $($work.Attempt + 1)) $errMsg" }
                     $finish = $true
@@ -241,6 +261,7 @@ function Invoke-ThrottledGet {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+$exportPath = $null
 try {
     Write-Log "=== Generate-MailboxReport Started ==="
 
@@ -263,7 +284,9 @@ try {
     $storageCtx = New-AzStorageContext -StorageAccountName $storageAcctName -UseConnectedAccount
     Write-Log "Storage context initialised for $storageAcctName." "DEBUG"
 
-    $exportPath = Join-Path $env:TEMP "MailboxOverview_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    $reportTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $blobName        = "MailboxOverview_$reportTimestamp.csv"
+    $exportPath      = Join-Path $env:TEMP $blobName
 
     # Acquire tokens via Managed Identity
     Write-Log "Acquiring Graph token (Reports.Read.All) via Managed Identity..." "DEBUG"
@@ -369,7 +392,11 @@ try {
     foreach ($mbx in $allMailboxes) {
         $reportRow = $reportLookup[$mbx.UserPrincipalName.ToLower()]
         if ($reportRow) {
-            $usedMB  = [math]::Round([long]$reportRow.'Storage Used (Byte)' / 1MB, 2)
+            $usedMB  = if ($reportRow.'Storage Used (Byte)') {
+                [math]::Round([long]$reportRow.'Storage Used (Byte)' / 1MB, 2)
+            } else {
+                0
+            }
             $quotaMB = if ($mbx.QuotaMBComputed -gt 0) { $mbx.QuotaMBComputed } else {
                 if ([long]$reportRow.'Prohibit Send Quota (Byte)' -gt 0) {
                     [math]::Round([long]$reportRow.'Prohibit Send Quota (Byte)' / 1MB, 2)
@@ -417,6 +444,7 @@ try {
         if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
             Write-Log "Refreshing EXO token before gap-fill collection..."
             $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $exoHeaders      = @{ Authorization = "Bearer $exoToken" }
             $tokenAcquiredAt = Get-Date
         }
 
@@ -441,12 +469,18 @@ try {
                 $gapErrors++
                 $results.Add([PSCustomObject]@{
                     EOID = $mbx.EOID; DisplayName = $mbx.DisplayName; UPN = $mbx.UserPrincipalName
-                    UsedMB = -1; UsedGB = -1; QuotaMB = -1; QuotaGB = -1; UsagePercent = -1
+                    UsedMB = -1; UsedGB = -1
+                    QuotaMB = $mbx.QuotaMBComputed
+                    QuotaGB = if ($mbx.QuotaMBComputed -gt 0) { [math]::Round($mbx.QuotaMBComputed / 1024, 3) } else { 0 }
+                    UsagePercent = -1
                     ItemCount = $null; DeletedItemCount = $null; DeletedItemSizeMB = $null; LastActivityDate = $null
-                    ArchiveStatus = $mbx.ArchiveStatus; ArchiveEnabled = $false; AutoExpandingArchiveEnabled = $false
-                    ArchiveUsedMB = $null; ArchiveUsedGB = $null; ArchiveQuotaMB = 0; ArchiveQuotaGB = 0
-                    RetentionPolicy = $null; RetentionHoldEnabled = $false
-                    LitigationHoldEnabled = $false; LitigationHoldDuration = $null
+                    ArchiveStatus = $mbx.ArchiveStatus; ArchiveEnabled = ($mbx.ArchiveStatus -eq 'Active')
+                    AutoExpandingArchiveEnabled = $mbx.AutoExpandingArchiveEnabled
+                    ArchiveUsedMB = $null; ArchiveUsedGB = $null
+                    ArchiveQuotaMB = $mbx.ArchiveQuotaMBComputed
+                    ArchiveQuotaGB = if ($mbx.ArchiveQuotaMBComputed -gt 0) { [math]::Round($mbx.ArchiveQuotaMBComputed / 1024, 3) } else { 0 }
+                    RetentionPolicy = $mbx.RetentionPolicy; RetentionHoldEnabled = $mbx.RetentionHoldEnabled
+                    LitigationHoldEnabled = $mbx.LitigationHoldEnabled; LitigationHoldDuration = $mbx.LitigationHoldDuration
                     WhenMailboxCreated = $mbx.WhenMailboxCreated
                     Status = 'ERROR'; Timestamp = $ts
                 })
@@ -520,7 +554,9 @@ try {
         # Refresh EXO token if it has been running long (Phase 1-4 can take time at scale)
         if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
             Write-Log "Refreshing EXO token before archive stats collection..."
-            $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $exoToken        = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $exoHeaders      = @{ Authorization = "Bearer $exoToken" }
+            $tokenAcquiredAt = Get-Date
         }
 
         $archItems = [System.Collections.Generic.List[object]]::new()
@@ -562,12 +598,14 @@ try {
     Write-Log "Collection complete: $fromReport from Reports API + $($gaps.Count) live fallback = $($results.Count) total." "SUCCESS"
 
     # ── Export CSV ────────────────────────────────────────────────────────────
+    if ($results.Count -eq 0) {
+        throw "No mailbox rows were collected; refusing to upload an empty report."
+    }
     $results | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
     Write-Log "CSV written: $exportPath ($($results.Count) rows)." "SUCCESS"
 
     # ── Upload to Blob Storage ────────────────────────────────────────────────
     Write-Log "Uploading to Blob Storage ($storageAcctName / $storageContainer)..."
-    $blobName = "MailboxOverview_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     Set-AzStorageBlobContent -Container $storageContainer -File $exportPath -Blob $blobName -Context $storageCtx -Force | Out-Null
     Write-Log "Blob uploaded: $blobName" "SUCCESS"
 
@@ -577,6 +615,7 @@ try {
         -Blob       $blobName `
         -Permission r `
         -ExpiryTime (Get-Date).AddHours(24) `
+        -Protocol HttpsOnly `
         -Context    $storageCtx `
         -FullUri
     Write-Log "SAS URL (24h): generated." "DEBUG"
@@ -599,5 +638,8 @@ try {
     Write-Log "Script failed: $_" "ERROR"
     throw
 } finally {
+    if ($exportPath -and (Test-Path -LiteralPath $exportPath)) {
+        Remove-Item -LiteralPath $exportPath -Force -ErrorAction SilentlyContinue
+    }
     Write-Log "=== Generate-MailboxReport Finished ==="
 }
