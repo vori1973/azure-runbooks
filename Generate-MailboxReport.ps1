@@ -142,6 +142,71 @@ function Invoke-WithRetry {
     }
 }
 
+function Get-HttpStatusCode {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $response = if ($ErrorRecord.Exception.PSObject.Properties['Response']) {
+        $ErrorRecord.Exception.Response
+    } else {
+        $null
+    }
+    if ($response -and $response.PSObject.Properties['StatusCode']) {
+        return [int]$response.StatusCode
+    }
+    return -1
+}
+
+function Get-EXOMailboxPageSet {
+    param(
+        [Parameter(Mandatory)][string[]]$Select,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string]$TenantId,
+        [int]$PageSize = 1000,
+        [bool]$UseServerFilter = $true
+    )
+
+    if ($UseServerFilter) {
+        $query = "?`$filter=RecipientTypeDetails eq 'UserMailbox'"
+        $separator = '&'
+    } else {
+        $query = '?'
+        $separator = ''
+    }
+    $query += "$separator`$select=$($Select -join ',')&`$top=$PageSize"
+
+    $mailboxes = [System.Collections.Generic.List[object]]::new()
+    $uri = "https://outlook.office365.com/adminapi/beta/$TenantId/Mailbox$query"
+    do {
+        $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers $Headers -Method GET }
+        foreach ($mailbox in $resp.value) {
+            if ($UseServerFilter -or (Get-JsonProp $mailbox 'RecipientTypeDetails') -eq 'UserMailbox') {
+                $mailboxes.Add($mailbox)
+            }
+        }
+        $uri = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
+    } while ($uri)
+
+    return ,$mailboxes
+}
+
+function Merge-EXOMailboxProperties {
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.Dictionary[string, object]]$MailboxById,
+        [Parameter(Mandatory)][object[]]$Source,
+        [Parameter(Mandatory)][string[]]$Properties
+    )
+
+    foreach ($item in $Source) {
+        $id = $item.ExternalDirectoryObjectId
+        if (-not $id -or -not $MailboxById.ContainsKey($id)) { continue }
+        $target = $MailboxById[$id]
+        foreach ($property in $Properties) {
+            if ($item.PSObject.Properties[$property]) {
+                $target | Add-Member -NotePropertyName $property -NotePropertyValue $item.$property -Force
+            }
+        }
+    }
+}
+
 function Invoke-ThrottledGet {
     <#
         Issues many GET requests concurrently through a single shared HttpClient,
@@ -315,19 +380,63 @@ try {
 
     # ── Phase 1: EXO metadata via Admin REST API ───────────────────────────────
     Write-Log "Retrieving mailbox metadata via EXO Admin REST API..."
-    $rawMailboxes = [System.Collections.Generic.List[object]]::new()
-    $uri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox" +
-           "?`$filter=RecipientTypeDetails eq 'UserMailbox'" +
-           "&`$select=ExternalDirectoryObjectId,UserPrincipalName,DisplayName," +
-           "ProhibitSendQuota,ArchiveStatus,ArchiveQuota,AutoExpandingArchiveEnabled," +
-           "RetentionPolicy,RetentionHoldEnabled,LitigationHoldEnabled,LitigationHoldDuration,ArchiveGuid," +
-           "WhenMailboxCreated" +
-           "&`$top=1000"
-    do {
-        $resp = Invoke-WithRetry { Invoke-RestMethod -Uri $uri -Headers $exoHeaders -Method GET }
-        foreach ($m in $resp.value) { $rawMailboxes.Add($m) }
-        $uri = if ($resp.PSObject.Properties['@odata.nextLink']) { $resp.'@odata.nextLink' } else { $null }
-    } while ($uri)
+    $mailboxProperties = @(
+        'ExternalDirectoryObjectId', 'UserPrincipalName', 'DisplayName',
+        'ProhibitSendQuota', 'ArchiveStatus', 'ArchiveQuota', 'AutoExpandingArchiveEnabled',
+        'RetentionPolicy', 'RetentionHoldEnabled', 'LitigationHoldEnabled',
+        'LitigationHoldDuration', 'ArchiveGuid', 'WhenMailboxCreated'
+    )
+    try {
+        $rawMailboxes = Get-EXOMailboxPageSet `
+            -Select $mailboxProperties `
+            -Headers $exoHeaders `
+            -TenantId $tenantId
+    } catch {
+        $statusCode = Get-HttpStatusCode $_
+        if ($statusCode -lt 500) { throw }
+
+        Write-Log "EXO rejected the combined mailbox query with HTTP $statusCode. Retrying in compatibility mode with smaller pages and property groups." "WARN"
+
+        $coreProperties = @(
+            'ExternalDirectoryObjectId', 'UserPrincipalName', 'DisplayName', 'RecipientTypeDetails'
+        )
+        $rawMailboxes = Get-EXOMailboxPageSet `
+            -Select $coreProperties `
+            -Headers $exoHeaders `
+            -TenantId $tenantId `
+            -PageSize 250 `
+            -UseServerFilter $false
+
+        $mailboxById = [System.Collections.Generic.Dictionary[string, object]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($mailbox in $rawMailboxes) {
+            if ($mailbox.ExternalDirectoryObjectId) {
+                $mailboxById[$mailbox.ExternalDirectoryObjectId] = $mailbox
+            }
+        }
+
+        $propertyGroups = @(
+            @('ProhibitSendQuota', 'ArchiveStatus', 'ArchiveQuota', 'ArchiveGuid'),
+            @('AutoExpandingArchiveEnabled', 'RetentionPolicy', 'RetentionHoldEnabled'),
+            @('LitigationHoldEnabled', 'LitigationHoldDuration', 'WhenMailboxCreated')
+        )
+        foreach ($propertyGroup in $propertyGroups) {
+            try {
+                $groupSelect = @('ExternalDirectoryObjectId', 'RecipientTypeDetails') + $propertyGroup
+                $groupRows = Get-EXOMailboxPageSet `
+                    -Select $groupSelect `
+                    -Headers $exoHeaders `
+                    -TenantId $tenantId `
+                    -PageSize 250 `
+                    -UseServerFilter $false
+                Merge-EXOMailboxProperties -MailboxById $mailboxById -Source $groupRows -Properties $propertyGroup
+            } catch {
+                $groupStatus = Get-HttpStatusCode $_
+                Write-Log "EXO property group unavailable (HTTP $groupStatus): $($propertyGroup -join ', '). Report will use defaults for these columns." "WARN"
+            }
+        }
+    }
     Write-Log "Found $($rawMailboxes.Count) mailboxes." "SUCCESS"
 
     $allMailboxes = @($rawMailboxes | ForEach-Object {
