@@ -11,6 +11,10 @@
     Microsoft Graph (User.Read.All)      — enumerate licensed member users
     EXO Admin REST (Exchange.ManageAsApp) — enable archive, auto-expand, set retention
 
+    Large-tenant provisioning uses one shared HttpClient with bounded asynchronous
+    requests. It does not use ForEach-Object -Parallel because Azure Automation
+    runspaces can exhaust the cloud sandbox's memory at scale.
+
     On completion, triggers Send-ReportNotification in the reporting account
     via cross-account Start-AzAutomationRunbook.
 
@@ -76,39 +80,6 @@ function Get-ManagedIdentityToken {
     (Get-AzAccessToken -ResourceUrl $Resource -AsSecureString).Token | ConvertFrom-SecureString -AsPlainText
 }
 
-function Invoke-HttpRequest {
-    param([string]$Method, [string]$Uri, [string]$Token, [string]$Body = $null)
-
-    $handler = [System.Net.Http.HttpClientHandler]::new()
-    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::None
-    $client  = [System.Net.Http.HttpClient]::new($handler)
-
-    try {
-        $client.DefaultRequestHeaders.Add("Authorization", "Bearer $Token")
-        $client.DefaultRequestHeaders.Add("Accept", "application/json")
-
-        $request = [System.Net.Http.HttpRequestMessage]::new(
-            [System.Net.Http.HttpMethod]::new($Method), $Uri)
-        if ($Body) {
-            $request.Content = [System.Net.Http.StringContent]::new(
-                $Body, [System.Text.Encoding]::UTF8, "application/json")
-        }
-
-        $resp = $client.SendAsync($request).Result
-        $text = $resp.Content.ReadAsStringAsync().Result
-
-        if (-not $resp.IsSuccessStatusCode) {
-            if ($text -match 'already has an archive') { return $text }
-            if ($text -match 'Readonly field AutoExpandingArchiveEnabled') { return $text }
-            throw "HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase): $text"
-        }
-        return $text
-    } finally {
-        $client.Dispose()
-        $handler.Dispose()
-    }
-}
-
 function Invoke-WithRetry {
     param([scriptblock]$ScriptBlock, [int]$MaxRetries = 3, [int]$DelaySeconds = 5)
     $attempt = 0
@@ -121,6 +92,168 @@ function Invoke-WithRetry {
             Start-Sleep -Seconds $DelaySeconds
         }
     }
+}
+
+function Invoke-ThrottledRequest {
+    <#
+        Issues POST/PATCH requests concurrently through one shared HttpClient using
+        Task.WaitAny. No PowerShell runspaces are created, so memory remains stable
+        when processing large tenants in the Azure Automation cloud sandbox.
+
+        Items must have Key, Method, Uri, and Body properties. Results are returned
+        in a dictionary keyed by Key with Success, StatusCode, Body, and Error fields.
+    #>
+    param(
+        [Parameter(Mandatory)][object[]]$Items,
+        [Parameter(Mandatory)][string]$BearerToken,
+        [int]$MaxConcurrency = 8,
+        [int]$MaxRetries = 3,
+        [string]$ProgressActivity = $null,
+        [int]$ProgressEvery = 1000
+    )
+
+    $results = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    if ($Items.Count -eq 0) { return $results }
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds(100)
+    $client.DefaultRequestHeaders.Authorization =
+        [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $BearerToken)
+    $client.DefaultRequestHeaders.Accept.Add(
+        [System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new('application/json')
+    )
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        foreach ($item in $Items) {
+            $queue.Enqueue([PSCustomObject]@{
+                Key     = $item.Key
+                Method  = $item.Method
+                Uri     = $item.Uri
+                Body    = $item.Body
+                Attempt = 0
+            })
+        }
+        $total = $queue.Count
+        $done  = 0
+
+        $inFlight = [System.Collections.Generic.Dictionary[object, object]]::new()
+        $startRequest = {
+            param([object]$Work)
+
+            $request = [System.Net.Http.HttpRequestMessage]::new(
+                [System.Net.Http.HttpMethod]::new($Work.Method),
+                $Work.Uri
+            )
+            if ($Work.Body) {
+                $request.Content = [System.Net.Http.StringContent]::new(
+                    $Work.Body,
+                    [System.Text.Encoding]::UTF8,
+                    'application/json'
+                )
+            }
+
+            $task = $client.SendAsync($request)
+            $inFlight[$task] = [PSCustomObject]@{
+                Work    = $Work
+                Request = $request
+                IsDelay = $false
+            }
+        }
+        $startNext = {
+            if ($queue.Count -gt 0) {
+                & $startRequest $queue.Dequeue()
+            }
+        }
+
+        for ($i = 0; $i -lt $MaxConcurrency; $i++) { & $startNext }
+
+        while ($inFlight.Count -gt 0) {
+            [System.Threading.Tasks.Task[]]$tasks = @($inFlight.Keys)
+            $completedIndex = [System.Threading.Tasks.Task]::WaitAny($tasks)
+            $completedTask  = $tasks[$completedIndex]
+            $state          = $inFlight[$completedTask]
+            [void]$inFlight.Remove($completedTask)
+
+            if ($state.IsDelay) {
+                & $startRequest $state.Work
+                continue
+            }
+
+            $statusCode     = -1
+            $body           = $null
+            $errorMessage   = $null
+            $transportError = $false
+            $response       = $null
+            try {
+                $response   = $completedTask.GetAwaiter().GetResult()
+                $statusCode = [int]$response.StatusCode
+                $body       = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            } catch {
+                $errorMessage = if ($_.Exception.InnerException) {
+                    $_.Exception.InnerException.Message
+                } else {
+                    $_.Exception.Message
+                }
+                $transportError = $true
+            } finally {
+                if ($response) { $response.Dispose() }
+                $state.Request.Dispose()
+            }
+
+            $finish = $false
+            if (-not $transportError -and $statusCode -ge 200 -and $statusCode -lt 300) {
+                $results[$state.Work.Key] = [PSCustomObject]@{
+                    Success = $true; StatusCode = $statusCode; Body = $body; Error = $null
+                }
+                $finish = $true
+            } else {
+                if (-not $errorMessage) {
+                    $errorMessage = "HTTP $statusCode"
+                    if ($body) { $errorMessage += ": $body" }
+                }
+
+                $retryable = $transportError -or $statusCode -eq 429 -or $statusCode -ge 500
+                if ($retryable -and $state.Work.Attempt -lt $MaxRetries) {
+                    $state.Work.Attempt++
+                    $retryDelay = [math]::Min(
+                        ([math]::Pow(2, $state.Work.Attempt) + (Get-Random -Minimum 1 -Maximum 5)),
+                        20
+                    )
+                    $delayTask = [System.Threading.Tasks.Task]::Delay(
+                        [TimeSpan]::FromSeconds($retryDelay)
+                    )
+                    $inFlight[$delayTask] = [PSCustomObject]@{
+                        Work = $state.Work; Request = $null; IsDelay = $true
+                    }
+                } else {
+                    $results[$state.Work.Key] = [PSCustomObject]@{
+                        Success    = $false
+                        StatusCode = $statusCode
+                        Body       = $body
+                        Error      = "(attempt $($state.Work.Attempt + 1)) $errorMessage"
+                    }
+                    $finish = $true
+                }
+            }
+
+            if ($finish) {
+                & $startNext
+                $done++
+                if ($ProgressActivity -and ($done % $ProgressEvery -eq 0 -or $done -eq $total)) {
+                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    Write-Host "[$timestamp] [INFO] $ProgressActivity - $done / $total ($([math]::Round($stopwatch.Elapsed.TotalSeconds))s elapsed)"
+                }
+            }
+        }
+    } finally {
+        $client.Dispose()
+    }
+
+    return $results
 }
 
 
@@ -255,156 +388,154 @@ try {
     })
     Write-Log "Pre-flight filter: $($users.Count) of $($allMailboxes.Count) mailbox(es) need action." "SUCCESS"
 
-    # Process mailboxes in parallel (ThrottleLimit=8)
-    # At 15K mailboxes, worst-case ~19 min — well within the 60-min token lifetime,
-    # so no token refresh is needed inside the parallel block.
-    Write-Log "Processing $($users.Count) mailbox(es) in parallel (ThrottleLimit=8)..."
+    # Process each action as a bounded async phase through one shared HttpClient.
+    # This follows Generate-MailboxReport.ps1 and avoids PowerShell runspaces entirely.
+    Write-Log "Processing $($users.Count) mailbox(es) asynchronously (concurrency=8)..."
     $total = $users.Count
 
-    $p_token           = $exoToken
-    $p_tenantId        = $tenantId
-    $p_retentionPolicy = $retentionPolicyName
-    $p_skipArchive     = [bool]$SkipArchive
-    $p_skipAutoExpand  = [bool]$SkipAutoExpand
-    $p_skipRetention   = [bool]$SkipRetentionPolicy
-    $p_skipLitHold     = [bool]$SkipLitigationHold
-    $p_litHoldDuration = $litigationHoldDuration
-    $p_orgAutoExpand   = $orgAutoExpand
-
     $results = [System.Collections.Generic.List[object]]::new()
-    $users | ForEach-Object -Parallel {
-        $user  = $_
-        $upn   = $user.UserPrincipalName
-        $token = $using:p_token
-        $tid   = $using:p_tenantId
-        $retPol          = $using:p_retentionPolicy
-        $skipArchive     = $using:p_skipArchive
-        $skipAutoExpand  = $using:p_skipAutoExpand
-        $skipRetention   = $using:p_skipRetention
-        $skipLitHold     = $using:p_skipLitHold
-        $litHoldDuration = $using:p_litHoldDuration
-        $orgAE           = $using:p_orgAutoExpand
+    $resultByUPN = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $archiveItems    = [System.Collections.Generic.List[object]]::new()
+    $autoExpandItems = [System.Collections.Generic.List[object]]::new()
+    $retentionItems  = [System.Collections.Generic.List[object]]::new()
+    $litigationItems = [System.Collections.Generic.List[object]]::new()
 
-        # Self-contained HTTP helper — no dependency on outer-scope functions.
-        # Creates a fresh HttpClient per call (thread-safe); handles EXO no-op responses.
-        function Invoke-EXORequest {
-            param([string]$Method, [string]$Uri, [string]$Token, [string]$Body = $null)
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-                $handler = [System.Net.Http.HttpClientHandler]::new()
-                $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::None
-                $client  = [System.Net.Http.HttpClient]::new($handler)
-                try {
-                    $client.DefaultRequestHeaders.Add("Authorization", "Bearer $Token")
-                    $client.DefaultRequestHeaders.Add("Accept", "application/json")
-                    $req = [System.Net.Http.HttpRequestMessage]::new(
-                        [System.Net.Http.HttpMethod]::new($Method), $Uri)
-                    if ($Body) {
-                        $req.Content = [System.Net.Http.StringContent]::new(
-                            $Body, [System.Text.Encoding]::UTF8, "application/json")
-                    }
-                    $resp = $client.SendAsync($req).Result
-                    $text = $resp.Content.ReadAsStringAsync().Result
-                    if (-not $resp.IsSuccessStatusCode) {
-                        if ($text -match 'already has an archive')                     { return $text }
-                        if ($text -match 'Readonly field AutoExpandingArchiveEnabled') { return $text }
-                        throw "HTTP $([int]$resp.StatusCode): $text"
-                    }
-                    return $text
-                } catch {
-                    if ($attempt -ge 3 -or $_.Exception.Message -notmatch '429|throttl') { throw }
-                    Start-Sleep -Seconds ([math]::Pow(2, $attempt))
-                } finally {
-                    $client.Dispose()
-                    $handler.Dispose()
-                }
-            }
-        }
+    $retentionBody = @{ RetentionPolicy = $retentionPolicyName } | ConvertTo-Json -Compress
+    $litigationBodyObject = [ordered]@{ LitigationHoldEnabled = $true }
+    if ($litigationHoldDuration) {
+        $litigationBodyObject['LitigationHoldDuration'] = $litigationHoldDuration
+    }
+    $litigationBody = $litigationBodyObject | ConvertTo-Json -Compress
 
-        $encodedUPN       = [Uri]::EscapeDataString($upn)
-        $archiveResult    = "N/A"
-        $autoExpandResult = "N/A"
-        $retentionResult  = "N/A"
-        $litigationResult = "N/A"
+    foreach ($user in $users) {
+        $upn = $user.UserPrincipalName
+        $encodedUPN = [Uri]::EscapeDataString($upn)
+        $mailboxUri = "https://outlook.office365.com/adminapi/beta/$tenantId/Mailbox('$encodedUPN')"
 
-        # 1 ── Enable Archive ──────────────────────────────────────────────────
-        if (-not $skipArchive) {
-            if ($user.ArchiveStatus -eq 'Active') {
-                $archiveResult = "Already enabled (no-op)"
-            } else {
-                try {
-                    $uri  = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')/Exchange.UpdateMailboxArchive"
-                    $resp = Invoke-EXORequest -Method POST -Uri $uri -Token $token -Body '{"archive":true}'
-                    $archiveResult = if ($resp -match 'already has an archive') { "Already enabled (no-op)" } else { "Enabled" }
-                } catch {
-                    $archiveResult = "Error: $($_.Exception.Message)"
-                    Write-Host "[ERROR] Failed to enable archive for $upn`: $_"
-                }
-            }
-        }
-
-        # 2 ── Auto-Expanding Archive ──────────────────────────────────────────
-        if (-not $skipAutoExpand) {
-            if ($orgAE -or [bool]$user.AutoExpandingArchiveEnabled) {
-                $autoExpandResult = "Already enabled (no-op)"
-            } else {
-                try {
-                    $uri    = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')"
-                    $result = Invoke-EXORequest -Method PATCH -Uri $uri -Token $token -Body '{"AutoExpandingArchiveEnabled":true}'
-                    $autoExpandResult = if ($result -match 'Readonly field AutoExpandingArchiveEnabled') { "Already enabled (no-op)" } else { "Enabled" }
-                } catch {
-                    $autoExpandResult = "Error: $($_.Exception.Message)"
-                    Write-Host "[ERROR] Failed to set auto-expand for $upn`: $_"
-                }
-            }
-        }
-
-        # 3 ── Retention Policy ────────────────────────────────────────────────
-        if (-not $skipRetention) {
-            if ($user.RetentionPolicy -eq $retPol) {
-                $retentionResult = "Already set: '$retPol'"
-            } else {
-                try {
-                    $uri = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')"
-                    Invoke-EXORequest -Method PATCH -Uri $uri -Token $token -Body "{`"RetentionPolicy`":`"$retPol`"}" | Out-Null
-                    $retentionResult = "Set: '$retPol'"
-                } catch {
-                    $retentionResult = "Error: $($_.Exception.Message)"
-                    Write-Host "[ERROR] Failed to set retention policy for $upn`: $_"
-                }
-            }
-        }
-
-        # 4 ── Litigation Hold ─────────────────────────────────────────────────
-        if (-not $skipLitHold) {
-            if ([bool]$user.LitigationHoldEnabled) {
-                $litigationResult = "Already enabled (no-op)"
-            } else {
-                try {
-                    $bodyObj = [ordered]@{ LitigationHoldEnabled = $true }
-                    if ($litHoldDuration) { $bodyObj['LitigationHoldDuration'] = $litHoldDuration }
-                    $bodyJson = $bodyObj | ConvertTo-Json -Compress
-                    $uri = "https://outlook.office365.com/adminapi/beta/$tid/Mailbox('$encodedUPN')"
-                    Invoke-EXORequest -Method PATCH -Uri $uri -Token $token -Body $bodyJson | Out-Null
-                    $holdSuffix   = if ($litHoldDuration) { " (duration: $litHoldDuration)" } else { "" }
-                    $litigationResult = "Enabled$holdSuffix"
-                } catch {
-                    $litigationResult = "Error: $($_.Exception.Message)"
-                    Write-Host "[ERROR] Failed to enable Litigation Hold for $upn`: $_"
-                }
-            }
-        }
-
-        [PSCustomObject]@{
+        $row = [PSCustomObject]@{
             EOID                 = $user.ExternalDirectoryObjectId
             DisplayName          = $user.DisplayName
             UPN                  = $upn
-            ArchiveResult        = $archiveResult
-            AutoExpandResult     = $autoExpandResult
-            RetentionResult      = $retentionResult
-            LitigationHoldResult = $litigationResult
+            ArchiveResult        = if ($SkipArchive) { "N/A" } elseif ($user.ArchiveStatus -eq 'Active') { "Already enabled (no-op)" } else { "Pending" }
+            AutoExpandResult     = if ($SkipAutoExpand) { "N/A" } elseif ($orgAutoExpand -or [bool]$user.AutoExpandingArchiveEnabled) { "Already enabled (no-op)" } else { "Pending" }
+            RetentionResult      = if ($SkipRetentionPolicy) { "N/A" } elseif ($user.RetentionPolicy -eq $retentionPolicyName) { "Already set: '$retentionPolicyName'" } else { "Pending" }
+            LitigationHoldResult = if ($SkipLitigationHold) { "N/A" } elseif ([bool]$user.LitigationHoldEnabled) { "Already enabled (no-op)" } else { "Pending" }
             Timestamp            = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         }
-    } -ThrottleLimit 8 | ForEach-Object { $results.Add($_) }
+        [void]$results.Add($row)
+        $resultByUPN[$upn] = $row
+
+        if ($row.ArchiveResult -eq "Pending") {
+            [void]$archiveItems.Add([PSCustomObject]@{
+                Key = $upn; Method = 'POST'
+                Uri = "$mailboxUri/Exchange.UpdateMailboxArchive"
+                Body = '{"archive":true}'
+            })
+        }
+        if ($row.AutoExpandResult -eq "Pending") {
+            [void]$autoExpandItems.Add([PSCustomObject]@{
+                Key = $upn; Method = 'PATCH'; Uri = $mailboxUri
+                Body = '{"AutoExpandingArchiveEnabled":true}'
+            })
+        }
+        if ($row.RetentionResult -eq "Pending") {
+            [void]$retentionItems.Add([PSCustomObject]@{
+                Key = $upn; Method = 'PATCH'; Uri = $mailboxUri; Body = $retentionBody
+            })
+        }
+        if ($row.LitigationHoldResult -eq "Pending") {
+            [void]$litigationItems.Add([PSCustomObject]@{
+                Key = $upn; Method = 'PATCH'; Uri = $mailboxUri; Body = $litigationBody
+            })
+        }
+    }
+
+    if ($archiveItems.Count -gt 0) {
+        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
+            Write-Log "Refreshing EXO token before archive provisioning..."
+            $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $tokenAcquiredAt = Get-Date
+        }
+        Write-Log "Enabling archive for $($archiveItems.Count) mailbox(es)..."
+        $phaseResults = Invoke-ThrottledRequest -Items $archiveItems -BearerToken $exoToken `
+            -MaxConcurrency 8 -ProgressActivity "Archive provisioning"
+        foreach ($item in $archiveItems) {
+            $requestResult = $phaseResults[$item.Key]
+            $resultByUPN[$item.Key].ArchiveResult =
+                if ($requestResult.Body -match 'already has an archive') {
+                    "Already enabled (no-op)"
+                } elseif ($requestResult.Success) {
+                    "Enabled"
+                } else {
+                    "Error: $($requestResult.Error)"
+                }
+        }
+    }
+
+    if ($autoExpandItems.Count -gt 0) {
+        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
+            Write-Log "Refreshing EXO token before auto-expanding archive provisioning..."
+            $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $tokenAcquiredAt = Get-Date
+        }
+        Write-Log "Enabling auto-expanding archive for $($autoExpandItems.Count) mailbox(es)..."
+        $phaseResults = Invoke-ThrottledRequest -Items $autoExpandItems -BearerToken $exoToken `
+            -MaxConcurrency 8 -ProgressActivity "Auto-expanding archive provisioning"
+        foreach ($item in $autoExpandItems) {
+            $requestResult = $phaseResults[$item.Key]
+            $resultByUPN[$item.Key].AutoExpandResult =
+                if ($requestResult.Body -match 'Readonly field AutoExpandingArchiveEnabled') {
+                    "Already enabled (no-op)"
+                } elseif ($requestResult.Success) {
+                    "Enabled"
+                } else {
+                    "Error: $($requestResult.Error)"
+                }
+        }
+    }
+
+    if ($retentionItems.Count -gt 0) {
+        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
+            Write-Log "Refreshing EXO token before retention policy provisioning..."
+            $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $tokenAcquiredAt = Get-Date
+        }
+        Write-Log "Assigning retention policy to $($retentionItems.Count) mailbox(es)..."
+        $phaseResults = Invoke-ThrottledRequest -Items $retentionItems -BearerToken $exoToken `
+            -MaxConcurrency 8 -ProgressActivity "Retention policy provisioning"
+        foreach ($item in $retentionItems) {
+            $requestResult = $phaseResults[$item.Key]
+            $resultByUPN[$item.Key].RetentionResult =
+                if ($requestResult.Success) {
+                    "Set: '$retentionPolicyName'"
+                } else {
+                    "Error: $($requestResult.Error)"
+                }
+        }
+    }
+
+    if ($litigationItems.Count -gt 0) {
+        if (((Get-Date) - $tokenAcquiredAt).TotalMinutes -ge 40) {
+            Write-Log "Refreshing EXO token before Litigation Hold provisioning..."
+            $exoToken = Get-ManagedIdentityToken -Resource "https://outlook.office365.com/"
+            $tokenAcquiredAt = Get-Date
+        }
+        Write-Log "Enabling Litigation Hold for $($litigationItems.Count) mailbox(es)..."
+        $phaseResults = Invoke-ThrottledRequest -Items $litigationItems -BearerToken $exoToken `
+            -MaxConcurrency 8 -ProgressActivity "Litigation Hold provisioning"
+        $holdSuffix = if ($litigationHoldDuration) { " (duration: $litigationHoldDuration)" } else { "" }
+        foreach ($item in $litigationItems) {
+            $requestResult = $phaseResults[$item.Key]
+            $resultByUPN[$item.Key].LitigationHoldResult =
+                if ($requestResult.Success) {
+                    "Enabled$holdSuffix"
+                } else {
+                    "Error: $($requestResult.Error)"
+                }
+        }
+    }
 
     # ── Summary ───────────────────────────────────────────────────────────────
     $applied = @($results | Where-Object {
@@ -463,7 +594,16 @@ try {
     Write-Log "Send-ReportNotification triggered." "DEBUG"
 
 } catch {
-    Write-Log "Script failed: $_" "ERROR"
+    $failureDetails = @(
+        "Message=$($_.Exception.Message)"
+        "ExceptionType=$($_.Exception.GetType().FullName)"
+        "FullyQualifiedErrorId=$($_.FullyQualifiedErrorId)"
+        "Category=$($_.CategoryInfo.Category)"
+        "Target=$($_.CategoryInfo.TargetName)"
+        "Position=$($_.InvocationInfo.PositionMessage -replace '\r?\n', ' ')"
+        "Stack=$($_.ScriptStackTrace -replace '\r?\n', ' <- ')"
+    ) -join " | "
+    Write-Log "Script failed: $failureDetails" "ERROR"
     throw
 } finally {
     Write-Log "=== Invoke-ScheduledMailboxProvisioning Finished ==="
