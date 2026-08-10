@@ -51,7 +51,7 @@
 param(
     [ValidateSet('D7', 'D30', 'D90', 'D180')]
     [string]$ReportsPeriod = 'D7',
-    [bool]$SendAsAttachment = $false,
+    [bool]$SendAsAttachment = $true,
     [bool]$DebugLogs = $false
 )
 

@@ -55,7 +55,7 @@ param(
     [switch]$SkipAutoExpand,
     [switch]$SkipRetentionPolicy,
     [switch]$SkipLitigationHold,
-    [bool]$SendAsAttachment = $false,
+    [bool]$SendAsAttachment = $true,
     [bool]$DebugLogs = $false
 )
 
