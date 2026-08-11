@@ -61,6 +61,7 @@
 
 .PARAMETER WhatIf
     Evaluate filters and report the actions that would be performed without changing mailboxes.
+    Defaults to $true. Set explicitly to $false for a live provisioning run.
 
 .PARAMETER ProvisioningCreatedAfter
     Optional per-run override for the Automation Variable with the same name.
@@ -85,20 +86,20 @@
 #>
 
 param(
-    [switch]$SkipArchive,
-    [switch]$SkipAutoExpand,
-    [switch]$SkipRetentionPolicy,
-    [switch]$SkipLitigationHold,
-    [switch]$WhatIf,
+    [bool]$WhatIf = $true,
+    [bool]$SkipArchive = $false,
+    [bool]$SkipAutoExpand = $false,
+    [bool]$SkipRetentionPolicy = $false,
+    [bool]$SkipLitigationHold = $false,
+    [bool]$SendAsAttachment = $true,
+    [bool]$DebugLogs = $false,
+    [string]$RetentionPolicyName,
+    [string]$LitigationHoldDuration,
     [string]$ProvisioningCreatedAfter,
     [string]$ProvisioningExcludeUpnRegex,
     [string]$ProvisioningExcludeUpns,
     [string]$ProvisioningExcludeRetentionPolicies,
-    [string]$ProvisioningMaximumChanges,
-    [string]$RetentionPolicyName,
-    [string]$LitigationHoldDuration,
-    [bool]$SendAsAttachment = $true,
-    [bool]$DebugLogs = $false
+    [string]$ProvisioningMaximumChanges
 )
 
 Set-StrictMode -Version Latest

@@ -501,12 +501,14 @@ Test in this order:
    - Email received with a working 24-hour download link
    - To see token acquisition and SAS generation detail, re-run with `-DebugLogs $true`
 
-3. **`Invoke-ScheduledMailboxProvisioning`** (provisioning account) — no parameters required; verify:
+3. **`Invoke-ScheduledMailboxProvisioning`** (provisioning account) — no parameters required for
+   the initial safe WhatIf run; verify:
    - Status: Completed
    - Mailbox counts logged in output (eligible / excluded / applied / would change / no-op / errors)
    - CSV blob visible in the storage container
    - `Send-ReportNotification` job appears in the reporting account Jobs list
    - Email received with the CSV attachment (default) or a working 24-hour download link
+   - After reviewing the CSV, run with `WhatIf = $false` only when ready to apply changes
 
 > Verify blob upload directly if email recipients aren't configured yet:
 > ```powershell
@@ -530,7 +532,10 @@ New-AzAutomationSchedule `
 Register-AzAutomationScheduledRunbook `
     -ResourceGroupName $rg -AutomationAccountName $provAccountName `
     -RunbookName "Invoke-ScheduledMailboxProvisioning" -ScheduleName "Daily-0200-UTC" `
-    -Parameters @{ SendAsAttachment = $false }   # set to $true to receive CSV as email attachment
+    -Parameters @{
+        WhatIf          = $false # required for live provisioning; default is safe WhatIf mode
+        SendAsAttachment = $false
+    }
 
 # Reporting: weekly Monday at 06:00 UTC
 New-AzAutomationSchedule `
@@ -604,20 +609,20 @@ The parameter and Automation Variable names are identical. This allows a normal 
 
 | Parameter | Default | Description |
 |---|---|---|
-| `SkipArchive` | off | Skip enabling archive mailboxes |
-| `SkipAutoExpand` | off | Skip enabling auto-expanding archive |
-| `SkipRetentionPolicy` | off | Skip assigning the retention policy |
-| `SkipLitigationHold` | off | Skip enabling Litigation Hold |
-| `WhatIf` | off | Apply all filters and report `Would enable`/`Would set` actions without submitting mailbox changes. Can be saved as `$true` on an Azure Automation schedule. |
+| `WhatIf` | `$true` | Safe default: apply all filters and report `Would enable`/`Would set` actions without submitting mailbox changes. Set explicitly to `$false` for live provisioning. |
+| `SkipArchive` | `$false` | Skip enabling archive mailboxes |
+| `SkipAutoExpand` | `$false` | Skip enabling auto-expanding archive |
+| `SkipRetentionPolicy` | `$false` | Skip assigning the retention policy |
+| `SkipLitigationHold` | `$false` | Skip enabling Litigation Hold |
+| `SendAsAttachment` | `$true` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
+| `DebugLogs` | `$false` | When `$true`, emit verbose DEBUG-level lines: token acquisition, action announcements, pre-flight result, SAS generation, notification trigger. Leave `$false` in scheduled runs to keep job output lean. Pass `$true` when troubleshooting. |
+| `RetentionPolicyName` | Automation Variable | Override the target EXO retention policy for this run. |
+| `LitigationHoldDuration` | Automation Variable | Override the hold duration for this run. Empty means Unlimited. |
 | `ProvisioningCreatedAfter` | Automation Variable | Override the minimum mailbox creation date for this run. |
 | `ProvisioningExcludeUpnRegex` | Automation Variable | Override the case-insensitive UPN exclusion regex for this run. |
 | `ProvisioningExcludeUpns` | Automation Variable | Override the JSON array of exact excluded UPNs for this run. Use `[]` to disable a stored list. |
 | `ProvisioningExcludeRetentionPolicies` | Automation Variable | Override the JSON array of excluded retention policies for this run. Use `[]` to disable a stored list. |
 | `ProvisioningMaximumChanges` | Automation Variable | Override the positive live-run mailbox limit for this run. |
-| `RetentionPolicyName` | Automation Variable | Override the target EXO retention policy for this run. |
-| `LitigationHoldDuration` | Automation Variable | Override the hold duration for this run. Empty means Unlimited. |
-| `SendAsAttachment` | `$true` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
-| `DebugLogs` | `$false` | When `$true`, emit verbose DEBUG-level lines: token acquisition, action announcements, pre-flight result, SAS generation, notification trigger. Leave `$false` in scheduled runs to keep job output lean. Pass `$true` when troubleshooting. |
 
 Example ad hoc WhatIf run overriding only selected defaults:
 
