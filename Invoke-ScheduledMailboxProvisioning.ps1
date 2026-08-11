@@ -36,6 +36,12 @@
                                    exposes WhenMailboxCreated as Edm.String so OData datetime
                                    operators are not supported). If absent, all mailboxes are
                                    processed.
+      ProvisioningExcludeUpnRegex — (optional) .NET regex matched against the complete UPN.
+      ProvisioningExcludeUpns     — (optional) JSON array of exact UPNs to exclude.
+      ProvisioningExcludeRetentionPolicies
+                                  — (optional) JSON array of current retention policy names to exclude.
+      ProvisioningMaximumChanges  — (optional) maximum eligible mailboxes allowed in a live run.
+                                    WhatIf runs report but do not enforce this limit.
 
 .PARAMETER SkipArchive
     Skip enabling archive mailboxes.
@@ -52,6 +58,30 @@
 .PARAMETER DebugLogs
     When $true, emit verbose DEBUG-level lines (token acquisition, action announcements, SAS generation, notification trigger).
     Default $false — only INFO / WARN / ERROR / SUCCESS lines are written, reducing job output volume.
+
+.PARAMETER WhatIf
+    Evaluate filters and report the actions that would be performed without changing mailboxes.
+
+.PARAMETER ProvisioningCreatedAfter
+    Optional per-run override for the Automation Variable with the same name.
+
+.PARAMETER ProvisioningExcludeUpnRegex
+    Optional per-run override for the Automation Variable with the same name.
+
+.PARAMETER ProvisioningExcludeUpns
+    Optional per-run JSON-array override for the Automation Variable with the same name.
+
+.PARAMETER ProvisioningExcludeRetentionPolicies
+    Optional per-run JSON-array override for the Automation Variable with the same name.
+
+.PARAMETER ProvisioningMaximumChanges
+    Optional per-run positive-integer override for the Automation Variable with the same name.
+
+.PARAMETER RetentionPolicyName
+    Optional per-run override for the target retention policy Automation Variable.
+
+.PARAMETER LitigationHoldDuration
+    Optional per-run override for the Litigation Hold duration Automation Variable.
 #>
 
 param(
@@ -59,6 +89,14 @@ param(
     [switch]$SkipAutoExpand,
     [switch]$SkipRetentionPolicy,
     [switch]$SkipLitigationHold,
+    [switch]$WhatIf,
+    [string]$ProvisioningCreatedAfter,
+    [string]$ProvisioningExcludeUpnRegex,
+    [string]$ProvisioningExcludeUpns,
+    [string]$ProvisioningExcludeRetentionPolicies,
+    [string]$ProvisioningMaximumChanges,
+    [string]$RetentionPolicyName,
+    [string]$LitigationHoldDuration,
     [bool]$SendAsAttachment = $true,
     [bool]$DebugLogs = $false
 )
@@ -78,6 +116,54 @@ function Write-Log {
 function Get-ManagedIdentityToken {
     param([string]$Resource)
     (Get-AzAccessToken -ResourceUrl $Resource -AsSecureString).Token | ConvertFrom-SecureString -AsPlainText
+}
+
+function Get-OptionalAutomationVariable {
+    param([string]$Name)
+    try { Get-AutomationVariable -Name $Name }
+    catch { $null }
+}
+
+function Get-ConfigurationValue {
+    param(
+        [string]$Name,
+        [System.Collections.IDictionary]$BoundParameters
+    )
+    if ($Name -in $BoundParameters.Keys) {
+        return $BoundParameters[$Name]
+    }
+    Get-OptionalAutomationVariable -Name $Name
+}
+
+function ConvertFrom-JsonStringSet {
+    param(
+        [string]$Json,
+        [string]$SettingName
+    )
+
+    $set = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        Write-Output -NoEnumerate $set
+        return
+    }
+
+    try {
+        $values = ConvertFrom-Json -InputObject $Json -NoEnumerate -ErrorAction Stop
+    } catch {
+        throw "Configuration '$SettingName' must contain a valid JSON array of strings. Detail: $($_.Exception.Message)"
+    }
+    if ($values -isnot [System.Array]) {
+        throw "Configuration '$SettingName' must contain a JSON array of strings."
+    }
+    foreach ($value in $values) {
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) {
+            throw "Configuration '$SettingName' must contain only non-empty strings."
+        }
+        [void]$set.Add($value.Trim())
+    }
+    Write-Output -NoEnumerate $set
 }
 
 function Invoke-WithRetry {
@@ -272,7 +358,12 @@ try {
     # Read configuration from Automation Variables
     $tenantId            = Get-AutomationVariable -Name "TenantId"
     $organization        = Get-AutomationVariable -Name "Organization"
-    $retentionPolicyName = Get-AutomationVariable -Name "RetentionPolicyName"
+    $retentionPolicyName = Get-ConfigurationValue `
+        -Name "RetentionPolicyName" `
+        -BoundParameters $PSBoundParameters
+    if ([string]::IsNullOrWhiteSpace($retentionPolicyName)) {
+        throw "Configuration 'RetentionPolicyName' is required as a runbook parameter or Automation Variable."
+    }
     $senderEmail         = Get-AutomationVariable -Name "SenderEmail"
     $recipientEmail      = Get-AutomationVariable -Name "RecipientEmail"
     $reportingRG         = Get-AutomationVariable -Name "ReportingAccountRG"
@@ -280,24 +371,81 @@ try {
     $storageAcctName     = Get-AutomationVariable -Name "StorageAccountName"
     $storageContainer    = Get-AutomationVariable -Name "StorageContainer"
 
-    # Read optional LitigationHoldDuration variable (missing variable = Unlimited)
-    $litigationHoldDuration = $null
-    try   { $litigationHoldDuration = Get-AutomationVariable -Name "LitigationHoldDuration" }
-    catch { Write-Log "LitigationHoldDuration variable not found — defaulting to Unlimited." }
+    $litigationHoldDuration = Get-ConfigurationValue `
+        -Name "LitigationHoldDuration" `
+        -BoundParameters $PSBoundParameters
 
-    # Read optional ProvisioningCreatedAfter variable (missing = process all mailboxes)
+    # Optional configuration uses per-run/schedule parameters first, then Automation Variables.
     $createdAfter = $null
-    try {
-        $val = Get-AutomationVariable -Name "ProvisioningCreatedAfter"
-        if ($val) {
-            $createdAfter = [datetime]::Parse($val, [System.Globalization.CultureInfo]::InvariantCulture,
-                                              [System.Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+    $createdAfterValue = Get-ConfigurationValue `
+        -Name "ProvisioningCreatedAfter" `
+        -BoundParameters $PSBoundParameters
+    if (-not [string]::IsNullOrWhiteSpace($createdAfterValue)) {
+        try {
+            $createdAfter = [datetime]::Parse(
+                $createdAfterValue,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AssumeUniversal
+            ).ToUniversalTime()
+        } catch {
+            throw "Configuration 'ProvisioningCreatedAfter' must be a valid ISO 8601 date. Detail: $($_.Exception.Message)"
         }
-    } catch { Write-Log "ProvisioningCreatedAfter variable not found — processing all mailboxes." }
+    }
+
+    $excludeUpnRegex = $null
+    $excludeUpnRegexValue = Get-ConfigurationValue `
+        -Name "ProvisioningExcludeUpnRegex" `
+        -BoundParameters $PSBoundParameters
+    if (-not [string]::IsNullOrWhiteSpace($excludeUpnRegexValue)) {
+        try {
+            $excludeUpnRegex = [regex]::new(
+                $excludeUpnRegexValue,
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+                [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+            )
+        } catch {
+            throw "Configuration 'ProvisioningExcludeUpnRegex' contains an invalid regex. Detail: $($_.Exception.Message)"
+        }
+    }
+
+    $excludeUpns = ConvertFrom-JsonStringSet `
+        -Json (Get-ConfigurationValue -Name "ProvisioningExcludeUpns" -BoundParameters $PSBoundParameters) `
+        -SettingName "ProvisioningExcludeUpns"
+    $excludeRetentionPolicies = ConvertFrom-JsonStringSet `
+        -Json (Get-ConfigurationValue -Name "ProvisioningExcludeRetentionPolicies" -BoundParameters $PSBoundParameters) `
+        -SettingName "ProvisioningExcludeRetentionPolicies"
+
+    $maximumChanges = 0
+    $maximumChangesValue = Get-ConfigurationValue `
+        -Name "ProvisioningMaximumChanges" `
+        -BoundParameters $PSBoundParameters
+    if (-not [string]::IsNullOrWhiteSpace($maximumChangesValue)) {
+        if (-not [int]::TryParse($maximumChangesValue, [ref]$maximumChanges) -or $maximumChanges -le 0) {
+            throw "Configuration 'ProvisioningMaximumChanges' must be a positive integer."
+        }
+    }
+
+    $overrideNames = @(
+        @(
+            "ProvisioningCreatedAfter",
+            "ProvisioningExcludeUpnRegex",
+            "ProvisioningExcludeUpns",
+            "ProvisioningExcludeRetentionPolicies",
+            "ProvisioningMaximumChanges",
+            "RetentionPolicyName",
+            "LitigationHoldDuration"
+        ) | Where-Object { $PSBoundParameters.ContainsKey($_) }
+    )
 
     Write-Log "Organization : $organization"
     Write-Log "Retention    : $retentionPolicyName"
+    Write-Log "Run mode     : $(if ($WhatIf) { 'WHATIF (no mailbox changes)' } else { 'LIVE' })"
+    if ($overrideNames.Count -gt 0) { Write-Log "Per-run configuration overrides: $($overrideNames -join ', ')" }
     if ($createdAfter) { Write-Log "Date filter  : mailboxes created on or after $($createdAfter.ToString('yyyy-MM-dd')) UTC" }
+    if ($excludeUpnRegex) { Write-Log "UPN regex exclusion enabled." }
+    if ($excludeUpns.Count -gt 0) { Write-Log "Explicit UPN exclusions: $($excludeUpns.Count)" }
+    if ($excludeRetentionPolicies.Count -gt 0) { Write-Log "Retention policy exclusions: $($excludeRetentionPolicies.Count)" }
+    if ($maximumChanges -gt 0) { Write-Log "Maximum live-run mailbox changes: $maximumChanges" }
     if (-not $SkipArchive)         { Write-Log "Action: Enable archive mailbox" "DEBUG" }
     if (-not $SkipAutoExpand)      { Write-Log "Action: Enable auto-expanding archive" "DEBUG" }
     if (-not $SkipRetentionPolicy) { Write-Log "Action: Assign retention policy '$retentionPolicyName'" "DEBUG" }
@@ -378,19 +526,54 @@ try {
         Write-Log "Date filter (client-side): $($allMailboxes.Count) of $beforeCount mailbox(es) match." "SUCCESS"
     }
 
-    # Pre-flight filter: skip mailboxes that already have every required setting
-    $users = @($allMailboxes | Where-Object {
+    # Apply configured exclusions before determining which mailboxes need action.
+    $eligibleMailboxes = [System.Collections.Generic.List[object]]::new()
+    $excludedMailboxes = [System.Collections.Generic.List[object]]::new()
+    foreach ($mailbox in $allMailboxes) {
+        $reasons = [System.Collections.Generic.List[string]]::new()
+        if ($excludeUpnRegex -and $excludeUpnRegex.IsMatch($mailbox.UserPrincipalName)) {
+            [void]$reasons.Add("UPN matches exclusion regex")
+        }
+        if ($excludeUpns.Contains($mailbox.UserPrincipalName)) {
+            [void]$reasons.Add("Explicit UPN exclusion")
+        }
+        if ($mailbox.RetentionPolicy -and $excludeRetentionPolicies.Contains([string]$mailbox.RetentionPolicy)) {
+            [void]$reasons.Add("Retention policy: $($mailbox.RetentionPolicy)")
+        }
+
+        if ($reasons.Count -gt 0) {
+            [void]$excludedMailboxes.Add([PSCustomObject]@{
+                Mailbox = $mailbox
+                Reason  = $reasons -join "; "
+            })
+        } else {
+            [void]$eligibleMailboxes.Add($mailbox)
+        }
+    }
+    Write-Log "Exclusion filter: $($excludedMailboxes.Count) excluded; $($eligibleMailboxes.Count) eligible." "SUCCESS"
+
+    # Pre-flight filter: skip eligible mailboxes that already have every required setting.
+    $users = @($eligibleMailboxes | Where-Object {
         $m = $_
         (-not $SkipArchive         -and $m.ArchiveStatus -ne 'Active') -or
         (-not $SkipAutoExpand      -and -not $orgAutoExpand -and -not [bool]$m.AutoExpandingArchiveEnabled) -or
         (-not $SkipRetentionPolicy -and $m.RetentionPolicy -ne $retentionPolicyName) -or
         (-not $SkipLitigationHold  -and -not [bool]$m.LitigationHoldEnabled)
     })
-    Write-Log "Pre-flight filter: $($users.Count) of $($allMailboxes.Count) mailbox(es) need action." "SUCCESS"
+    Write-Log "Pre-flight filter: $($users.Count) of $($eligibleMailboxes.Count) eligible mailbox(es) need action." "SUCCESS"
+
+    if ($maximumChanges -gt 0 -and $users.Count -gt $maximumChanges) {
+        $limitMessage = "$($users.Count) mailbox(es) need action, exceeding ProvisioningMaximumChanges=$maximumChanges."
+        if ($WhatIf) {
+            Write-Log "$limitMessage WhatIf evaluation will continue." "WARN"
+        } else {
+            throw "$limitMessage No mailbox changes were submitted."
+        }
+    }
 
     # Process each action as a bounded async phase through one shared HttpClient.
     # This follows Generate-MailboxReport.ps1 and avoids PowerShell runspaces entirely.
-    Write-Log "Processing $($users.Count) mailbox(es) asynchronously (concurrency=8)..."
+    Write-Log "$(if ($WhatIf) { 'Evaluating' } else { 'Processing' }) $($users.Count) mailbox(es)$(if ($WhatIf) { ' in WhatIf mode' } else { ' asynchronously (concurrency=8)' })..."
     $total = $users.Count
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -401,6 +584,22 @@ try {
     $autoExpandItems = [System.Collections.Generic.List[object]]::new()
     $retentionItems  = [System.Collections.Generic.List[object]]::new()
     $litigationItems = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($excluded in $excludedMailboxes) {
+        $mailbox = $excluded.Mailbox
+        [void]$results.Add([PSCustomObject]@{
+            EOID                  = $mailbox.ExternalDirectoryObjectId
+            DisplayName           = $mailbox.DisplayName
+            UPN                   = $mailbox.UserPrincipalName
+            Excluded              = $true
+            ExclusionReason       = $excluded.Reason
+            ArchiveResult         = "Excluded"
+            AutoExpandResult      = "Excluded"
+            RetentionResult       = "Excluded"
+            LitigationHoldResult  = "Excluded"
+            Timestamp             = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        })
+    }
 
     $retentionBody = @{ RetentionPolicy = $retentionPolicyName } | ConvertTo-Json -Compress
     $litigationBodyObject = [ordered]@{ LitigationHoldEnabled = $true }
@@ -418,10 +617,12 @@ try {
             EOID                 = $user.ExternalDirectoryObjectId
             DisplayName          = $user.DisplayName
             UPN                  = $upn
-            ArchiveResult        = if ($SkipArchive) { "N/A" } elseif ($user.ArchiveStatus -eq 'Active') { "Already enabled (no-op)" } else { "Pending" }
-            AutoExpandResult     = if ($SkipAutoExpand) { "N/A" } elseif ($orgAutoExpand -or [bool]$user.AutoExpandingArchiveEnabled) { "Already enabled (no-op)" } else { "Pending" }
-            RetentionResult      = if ($SkipRetentionPolicy) { "N/A" } elseif ($user.RetentionPolicy -eq $retentionPolicyName) { "Already set: '$retentionPolicyName'" } else { "Pending" }
-            LitigationHoldResult = if ($SkipLitigationHold) { "N/A" } elseif ([bool]$user.LitigationHoldEnabled) { "Already enabled (no-op)" } else { "Pending" }
+            Excluded             = $false
+            ExclusionReason      = $null
+            ArchiveResult        = if ($SkipArchive) { "N/A" } elseif ($user.ArchiveStatus -eq 'Active') { "Already enabled (no-op)" } elseif ($WhatIf) { "Would enable" } else { "Pending" }
+            AutoExpandResult     = if ($SkipAutoExpand) { "N/A" } elseif ($orgAutoExpand -or [bool]$user.AutoExpandingArchiveEnabled) { "Already enabled (no-op)" } elseif ($WhatIf) { "Would enable" } else { "Pending" }
+            RetentionResult      = if ($SkipRetentionPolicy) { "N/A" } elseif ($user.RetentionPolicy -eq $retentionPolicyName) { "Already set: '$retentionPolicyName'" } elseif ($WhatIf) { "Would set: '$retentionPolicyName'" } else { "Pending" }
+            LitigationHoldResult = if ($SkipLitigationHold) { "N/A" } elseif ([bool]$user.LitigationHoldEnabled) { "Already enabled (no-op)" } elseif ($WhatIf) { "Would enable" } else { "Pending" }
             Timestamp            = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         }
         [void]$results.Add($row)
@@ -547,7 +748,14 @@ try {
     $noops  = @($results | Where-Object {
         $_.ArchiveResult        -match '^Already' -or
         $_.AutoExpandResult     -match '^Already' -or
+        $_.RetentionResult      -match '^Already' -or
         $_.LitigationHoldResult -match '^Already'
+    }).Count
+    $wouldChange = @($results | Where-Object {
+        $_.ArchiveResult        -match '^Would' -or
+        $_.AutoExpandResult     -match '^Would' -or
+        $_.RetentionResult      -match '^Would' -or
+        $_.LitigationHoldResult -match '^Would'
     }).Count
     $errors = @($results | Where-Object {
         $_.ArchiveResult        -match '^Error' -or
@@ -556,7 +764,7 @@ try {
         $_.LitigationHoldResult -match '^Error'
     }).Count
 
-    Write-Log "Total: $total  |  Applied: $applied  |  No-op: $noops  |  Errors: $errors"
+    Write-Log "Eligible: $total  |  Excluded: $($excludedMailboxes.Count)  |  Applied: $applied  |  Would change: $wouldChange  |  No-op: $noops  |  Errors: $errors"
 
     # ── Export log CSV and upload to Blob Storage ─────────────────────────────
     $blobName   = "MailboxProvisioning_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
@@ -585,10 +793,10 @@ try {
         -AutomationAccountName $reportingAccount `
         -Name                  "Send-ReportNotification" `
         -Parameters @{
-            Subject          = "Mailbox Provisioning Complete — $(Get-Date -Format 'yyyy-MM-dd') — Total: $total  Errors: $errors"
+            Subject          = "$(if ($WhatIf) { '[WHATIF] ' })Mailbox Provisioning Complete — $(Get-Date -Format 'yyyy-MM-dd') — Eligible: $total  Excluded: $($excludedMailboxes.Count)  Errors: $errors"
             PortalUrl        = if ($SendAsAttachment) { '' } else { $sasUrl }
             BlobName         = $blobName
-            RowCount         = $total
+            RowCount         = $results.Count
             SendAsAttachment = $SendAsAttachment
         } | Out-Null
     Write-Log "Send-ReportNotification triggered." "DEBUG"

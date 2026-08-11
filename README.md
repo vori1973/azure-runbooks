@@ -384,7 +384,7 @@ Open `Set-AutomationVariables.ps1` and fill in:
 
 - **Section 1** — infrastructure names (edit only if you used different names than the defaults)
 - **Section 2** — tenant-specific values: tenant ID, organization domain, sender/recipient email,
-  retention policy name, report recipients
+  retention policy name, Litigation Hold duration, provisioning filters/safety limit, and report recipients
 
 Then run it:
 
@@ -393,7 +393,9 @@ Then run it:
 ```
 
 The script confirms your Azure context before writing and prints all variables at the end.
-It is safe to re-run — existing values are overwritten.
+It validates the cached Azure token and prompts for sign-in when authentication is missing or expired.
+It is safe to re-run — existing values are overwritten, and disabled provisioning settings are written
+as an empty string or `[]` so stale values do not remain active.
 
 #### Automation Variables reference
 
@@ -410,7 +412,27 @@ It is safe to re-run — existing values are overwritten.
 | `ReportingAccountName` | Name of the reporting Automation Account |
 | `StorageAccountName` | Blob Storage account name |
 | `StorageContainer` | Container name (`reports`) |
-| `LitigationHoldDuration` | **(Optional)** Hold duration in days (e.g. `2555` = 7 years) or `Unlimited`. If absent, defaults to Unlimited. |
+| `LitigationHoldDuration` | Hold duration in days (e.g. `2555` = 7 years) or `Unlimited`. Empty defaults to Unlimited. |
+| `ProvisioningCreatedAfter` | ISO 8601 date. Only mailboxes created on or after this date are considered. Empty disables the date filter. |
+| `ProvisioningExcludeUpnRegex` | Case-insensitive .NET regex matched against the complete UPN. Empty disables regex filtering. |
+| `ProvisioningExcludeUpns` | JSON array of exact UPNs to exclude: `["svc-backup@contoso.com","admin@contoso.com"]`. Use `[]` to disable. |
+| `ProvisioningExcludeRetentionPolicies` | JSON array of current retention policy names whose mailboxes must be excluded. Use `[]` to disable. |
+| `ProvisioningMaximumChanges` | Positive integer limiting eligible mailboxes in a live run. Empty disables the limit. WhatIf reports limit violations without stopping evaluation. |
+
+All exclusion filters use **OR** logic. A mailbox is excluded when its UPN matches the regex, its
+UPN appears in the exact list, or its current retention policy appears in the policy list.
+Excluded mailboxes remain in the CSV with an `ExclusionReason`.
+
+Regex values use .NET syntax without JavaScript `/.../i` delimiters; matching is already
+case-insensitive. Examples:
+
+```powershell
+# Local part contains at least one letter and one digit
+$provisioningExcludeUpnRegex = '^(?=[^@]*[A-Za-z])(?=[^@]*\d)[^@]+@'
+
+# Local part contains "testuser"
+$provisioningExcludeUpnRegex = '^[\w.%+-]*testuser[\w.%+-]*@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+```
 
 **aa-exo-reporting**
 
@@ -481,10 +503,10 @@ Test in this order:
 
 3. **`Invoke-ScheduledMailboxProvisioning`** (provisioning account) — no parameters required; verify:
    - Status: Completed
-   - Mailbox counts logged in output (applied / no-op / errors)
+   - Mailbox counts logged in output (eligible / excluded / applied / would change / no-op / errors)
    - CSV blob visible in the storage container
    - `Send-ReportNotification` job appears in the reporting account Jobs list
-   - Email received with a working 24-hour download link
+   - Email received with the CSV attachment (default) or a working 24-hour download link
 
 > Verify blob upload directly if email recipients aren't configured yet:
 > ```powershell
@@ -572,10 +594,13 @@ single sender mailbox — the reporting identity cannot send as any other user i
 | Parameter | Default | Description |
 |---|---|---|
 | `ReportsPeriod` | `D7` | Graph Reports API period: `D7`, `D30`, `D90`, `D180` |
-| `SendAsAttachment` | `$false` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
+| `SendAsAttachment` | `$true` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
 | `DebugLogs` | `$false` | When `$true`, emit verbose DEBUG-level lines: token acquisition, storage context init, SAS generation, notification trigger. Leave `$false` in scheduled runs to keep job output lean. Pass `$true` when troubleshooting. |
 
 ### Invoke-ScheduledMailboxProvisioning.ps1
+
+For the seven operational settings below, precedence is **runbook/schedule parameter → Automation Variable → disabled/default**.
+The parameter and Automation Variable names are identical. This allows a normal schedule to use tenant defaults while an ad hoc run overrides only the settings it supplies.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -583,8 +608,37 @@ single sender mailbox — the reporting identity cannot send as any other user i
 | `SkipAutoExpand` | off | Skip enabling auto-expanding archive |
 | `SkipRetentionPolicy` | off | Skip assigning the retention policy |
 | `SkipLitigationHold` | off | Skip enabling Litigation Hold |
-| `SendAsAttachment` | `$false` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
+| `WhatIf` | off | Apply all filters and report `Would enable`/`Would set` actions without submitting mailbox changes. Can be saved as `$true` on an Azure Automation schedule. |
+| `ProvisioningCreatedAfter` | Automation Variable | Override the minimum mailbox creation date for this run. |
+| `ProvisioningExcludeUpnRegex` | Automation Variable | Override the case-insensitive UPN exclusion regex for this run. |
+| `ProvisioningExcludeUpns` | Automation Variable | Override the JSON array of exact excluded UPNs for this run. Use `[]` to disable a stored list. |
+| `ProvisioningExcludeRetentionPolicies` | Automation Variable | Override the JSON array of excluded retention policies for this run. Use `[]` to disable a stored list. |
+| `ProvisioningMaximumChanges` | Automation Variable | Override the positive live-run mailbox limit for this run. |
+| `RetentionPolicyName` | Automation Variable | Override the target EXO retention policy for this run. |
+| `LitigationHoldDuration` | Automation Variable | Override the hold duration for this run. Empty means Unlimited. |
+| `SendAsAttachment` | `$true` | Attach CSV to email instead of including a blob URL. Blob is always uploaded regardless. |
 | `DebugLogs` | `$false` | When `$true`, emit verbose DEBUG-level lines: token acquisition, action announcements, pre-flight result, SAS generation, notification trigger. Leave `$false` in scheduled runs to keep job output lean. Pass `$true` when troubleshooting. |
+
+Example ad hoc WhatIf run overriding only selected defaults:
+
+```powershell
+Start-AzAutomationRunbook `
+    -ResourceGroupName $rg `
+    -AutomationAccountName $provAccountName `
+    -Name "Invoke-ScheduledMailboxProvisioning" `
+    -Parameters @{
+        WhatIf                               = $true
+        RetentionPolicyName                  = "Move 5 days old"
+        ProvisioningExcludeUpnRegex          = '^[\w.%+-]*testuser[\w.%+-]*@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        ProvisioningExcludeUpns              = '["temporary-skip@contoso.com"]'
+        ProvisioningExcludeRetentionPolicies = '[]'
+        ProvisioningMaximumChanges           = "1000"
+    }
+```
+
+Omitted operational parameters use their Automation Variables. Passing `[]` disables a stored JSON
+list for that run. WhatIf applies all filters, produces/uploads the CSV, and sends the notification
+without submitting mailbox-changing requests.
 
 ### Send-ReportNotification.ps1
 

@@ -38,21 +38,45 @@ $retentionPolicy    = "Two Year Retention"                    # exact name of th
 $reportRecipients   = '["admin@MngEnvMCAP545510.onmicrosoft.com"]'
 
 # Litigation Hold duration — integer days (e.g. 2555 = 7 years, 1825 = 5 years) or "Unlimited".
-# Leave empty to default to Unlimited; the variable will not be written if blank.
+# Leave empty to default to Unlimited; an empty Automation Variable will be written.
 $litigationHoldDuration = "2555"
 
 # Mailbox creation date filter — ISO 8601 date (e.g. "2025-01-01").
 # Only mailboxes created on or after this date will be provisioned.
-# Leave empty to process all mailboxes; the variable will not be written if blank.
+# Leave empty to process all mailboxes.
 $provisioningCreatedAfter = "2026-03-17"
+
+# Optional mailbox exclusions and live-run safety limit.
+# All settings are written so the Automation Account has a consistent variable set.
+$provisioningExcludeUpnRegex          = "" # Example: '^(?=[^@]*[A-Za-z])(?=[^@]*\d)[^@]+@'
+$provisioningExcludeUpns              = '[]' # Example: '["svc-backup@contoso.com","admin@contoso.com"]'
+$provisioningExcludeRetentionPolicies = '[]' # Example: '["VIP Retention Policy","Legal Hold Policy"]'
+$provisioningMaximumChanges           = "" # Example: "500"
 
 # ==============================================================================
 # SECTION 3 — Confirm context before writing
 # ==============================================================================
 
 $ctx = Get-AzContext
-if (-not $ctx) {
-    throw "No Azure context found. Run Connect-AzAccount first."
+$requiresLogin = -not $ctx -or $ctx.Tenant.Id -ne $tenantId
+if (-not $requiresLogin) {
+    try {
+        Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop | Out-Null
+    } catch {
+        $requiresLogin = $true
+        Write-Warning "The cached Azure context token is expired or unavailable."
+    }
+}
+
+if ($requiresLogin) {
+    Write-Host "Signing in to Azure tenant $tenantId..." -ForegroundColor Yellow
+    try {
+        Connect-AzAccount -Tenant $tenantId -ErrorAction Stop | Out-Null
+        Get-AzAccessToken -ResourceUrl "https://management.azure.com/" -ErrorAction Stop | Out-Null
+        $ctx = Get-AzContext
+    } catch {
+        throw "Azure authentication failed or was canceled. Run 'Connect-AzAccount -Tenant $tenantId' and retry. Detail: $($_.Exception.Message)"
+    }
 }
 Write-Host ""
 Write-Host "Azure context : $($ctx.Subscription.Name) ($($ctx.Subscription.Id))"
@@ -83,9 +107,13 @@ $provVars = [ordered]@{
     ReportingAccountName = $repAccountName
     StorageAccountName   = $storageAcctName   # provisioning runbook uploads its log CSV to the same container
     StorageContainer     = $storageContainer
+    LitigationHoldDuration                = $litigationHoldDuration
+    ProvisioningCreatedAfter              = $provisioningCreatedAfter
+    ProvisioningExcludeUpnRegex           = $provisioningExcludeUpnRegex
+    ProvisioningExcludeUpns               = $provisioningExcludeUpns
+    ProvisioningExcludeRetentionPolicies  = $provisioningExcludeRetentionPolicies
+    ProvisioningMaximumChanges            = $provisioningMaximumChanges
 }
-if ($litigationHoldDuration)    { $provVars['LitigationHoldDuration']   = $litigationHoldDuration }
-if ($provisioningCreatedAfter) { $provVars['ProvisioningCreatedAfter'] = $provisioningCreatedAfter }
 
 function Set-OrNewAutomationVariable {
     param(
@@ -211,4 +239,24 @@ Set-AzAutomationVariable `
 
 # To remove the filter and process all mailboxes again:
 # Remove-AzAutomationVariable -ResourceGroupName $rg -AutomationAccountName $provAccountName -Name "ProvisioningCreatedAfter"
+#>
+
+# ==============================================================================
+# SNIPPET — Run a filter evaluation with ad hoc overrides.
+# Omitted settings continue to use their Automation Variables.
+# ==============================================================================
+<#
+Start-AzAutomationRunbook `
+    -ResourceGroupName     $rg `
+    -AutomationAccountName $provAccountName `
+    -Name                  "Invoke-ScheduledMailboxProvisioning" `
+    -Parameters            @{
+        WhatIf                                      = $true
+        ProvisioningCreatedAfter                    = "2026-01-01"
+        ProvisioningExcludeUpns                     = '["temporary-skip@contoso.com"]'
+        ProvisioningExcludeRetentionPolicies        = '[]'
+        ProvisioningMaximumChanges                  = "1000"
+        RetentionPolicyName                         = "Two Year Retention"
+        LitigationHoldDuration                      = "2555"
+    }
 #>
